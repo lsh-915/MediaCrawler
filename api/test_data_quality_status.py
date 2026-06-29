@@ -71,3 +71,7 @@ def test_data_completeness_endpoint_returns_repair_hint(tmp_path: Path) -> None:
     assert report["message"] == "采集不全，请补全"
     assert report["repair_available"] is True
     assert report["recommended_repair_dimensions"] == ["scripts", "content_asset"]
+    task = manager.get_task(task_id)
+    assert task is not None
+    assert task.to_dict()["data_quality_status"] == "incomplete"
+    assert (tmp_path / "data" / "cache" / "video_completeness_index.jsonl").exists()

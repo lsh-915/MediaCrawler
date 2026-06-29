@@ -33,6 +33,7 @@ from typing import Literal
 from douyin_scraper import DouyinScraper, ScraperConfig
 from douyin_scraper.completeness import (
     select_incomplete_videos,
+    update_video_completeness_index,
     write_task_completeness_report,
 )
 from douyin_scraper.exceptions import (
@@ -1343,7 +1344,10 @@ async def data_completeness(
     workspace = Path(task.workspace)
     if not workspace.exists():
         raise HTTPException(status_code=404, detail="任务 workspace 不存在")
-    return write_task_completeness_report(workspace, task_id=task_id)
+    report = write_task_completeness_report(workspace, task_id=task_id)
+    update_video_completeness_index(workspace, task_id=task_id, report=report)
+    tm.update_task_data_quality(task_id, report)
+    return report
 
 
 @router.get("/data/preview/{task_id}", summary="预览任务结果数据")

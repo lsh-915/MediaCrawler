@@ -397,6 +397,32 @@ class TaskManager:
             logger.warning("data quality check failed for task %s: %s", task.task_id, exc)
         return result
 
+    def update_task_data_quality(self, task_id: str, report: Dict[str, Any]) -> None:
+        """Persist data quality fields from a freshly built completeness report."""
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task is None:
+                return
+            task.data_quality_status = str(report.get("data_quality_status") or "")
+            task.data_quality_message = str(report.get("data_quality_message") or report.get("message") or "")
+            task.repair_available = bool(report.get("repair_available"))
+            task.recommended_repair_dimensions = list(report.get("recommended_repair_dimensions") or [])
+            if task.result is not None:
+                task.result.update({
+                    "data_quality_status": task.data_quality_status,
+                    "data_quality_message": task.data_quality_message,
+                    "repair_available": task.repair_available,
+                    "recommended_repair_dimensions": task.recommended_repair_dimensions,
+                    "completeness": {
+                        "videos_total": report.get("videos_total", 0),
+                        "videos_complete": report.get("videos_complete", 0),
+                        "videos_incomplete": report.get("videos_incomplete", 0),
+                        "dimensions": report.get("dimensions", {}),
+                        "incomplete_reasons": report.get("incomplete_reasons", {}),
+                    },
+                })
+            self._save_registry()
+
     def _register_shutdown_handlers(self) -> None:
         """
         注册优雅关闭处理器（替代纯 atexit 方案）。
