@@ -61,6 +61,7 @@ class ScraperConfig:
         self.whisper_model: str = "small"
         self.keep_videos: bool = False
         self.max_workers: int = 1
+        self.max_script_raw_items: Optional[int] = None
 
         # 加载配置
         if config is not None:
@@ -136,6 +137,18 @@ class ScraperConfig:
                     f"max_workers 必须是整数: {data.get('max_workers')}",
                     step="config",
                 ) from e
+        if "max_script_raw_items" in data:
+            value = data["max_script_raw_items"]
+            if value in (None, ""):
+                self.max_script_raw_items = None
+            else:
+                try:
+                    self.max_script_raw_items = int(value)
+                except (ValueError, TypeError) as e:
+                    raise ConfigError(
+                        f"max_script_raw_items must be int: {value}",
+                        step="config",
+                    ) from e
         if "state_dir_name" in data:
             self.state_dir_name = str(data["state_dir_name"])
         if "retry" in data:
@@ -215,6 +228,8 @@ class ScraperConfig:
             errors.append(f"无效端口: {self.chrome_debugging_port}")
         if self.retry.max_attempts < 1:
             errors.append("retry.max_attempts 必须 >= 1")
+        if self.max_script_raw_items is not None and self.max_script_raw_items < 0:
+            errors.append(f"max_script_raw_items must be >= 0, current: {self.max_script_raw_items}")
         if self.max_videos_per_keyword < 1:
             errors.append(f"max_videos_per_keyword 必须 >= 1, 当前: {self.max_videos_per_keyword}")
         if not isinstance(self.keywords, list):

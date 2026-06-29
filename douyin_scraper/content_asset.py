@@ -56,6 +56,7 @@ def _empty_stats() -> Dict[str, Any]:
         "fallback_script_total": 0,
         "missing_script_total": 0,
         "content_asset_csv_generated": False,
+        "content_asset_full_csv_generated": False,
         "errors": [],
     }
 
@@ -316,6 +317,7 @@ def build_content_asset(
     stats = _empty_stats()
     output_dir.mkdir(parents=True, exist_ok=True)
     jsonl_path = output_dir / "content_asset.jsonl"
+    full_csv_path = output_dir / "content_asset_full.csv"
     csv_path = output_dir / "content_asset.csv"
 
     search_rows = _read_csv(search_result_csv, "search_result", stats)
@@ -370,6 +372,12 @@ def build_content_asset(
     with open(str(jsonl_path), "w", encoding="utf-8") as f:
         for row in rows:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+    with open(str(full_csv_path), "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=CONTENT_ASSET_FIELDNAMES)
+        writer.writeheader()
+        writer.writerows(rows)
+    stats["content_asset_full_csv_generated"] = True
 
     with open(str(csv_path), "w", encoding="utf-8-sig", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=CONTENT_ASSET_FIELDNAMES)

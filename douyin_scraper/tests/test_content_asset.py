@@ -97,7 +97,29 @@ def test_content_asset_from_search_and_title_only(tmp_path: Path) -> None:
     assert stats["rows_in"] == 1
     assert stats["rows_out"] == 1
     assert stats["content_asset_csv_generated"] is True
+    assert stats["content_asset_full_csv_generated"] is True
     assert csv_path.read_bytes()[:3] == b"\xef\xbb\xbf"
+    full_csv_path = csv_path.with_name("content_asset_full.csv")
+    assert full_csv_path.read_bytes()[:3] == b"\xef\xbb\xbf"
+    full_csv_rows = _read_csv(full_csv_path)
+    assert len(full_csv_rows) == 1
+    assert full_csv_rows[0]["video_id"] == "a1"
+    assert full_csv_rows[0]["clean_title"] == "\u4e2d\u6587"
+    csv_rows = _read_csv(csv_path)
+    with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
+        headers = csv.DictReader(f).fieldnames
+    assert headers == [
+        "video_id",
+        "platform",
+        "script_text",
+        "likes",
+        "favorites",
+        "shares",
+        "comments",
+    ]
+    assert csv_rows == []
+    assert stats["standard_rows_out"] == 0
+    assert stats["standard_rows_skipped"] == 1
     json_text = jsonl_path.read_text(encoding="utf-8")
     assert "\u4e2d\u6587" in json_text
     assert "\\u4e2d\\u6587" not in json_text

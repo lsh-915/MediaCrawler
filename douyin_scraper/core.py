@@ -580,6 +580,9 @@ class DouyinScraper:
             self._state.mark_step_completed(step, detail=f"output={csv_path}")
             self._paths["content_asset_jsonl"] = jsonl_path
             self._paths["content_asset_csv"] = csv_path
+            full_csv_path = csv_path.with_name("content_asset_full.csv")
+            if full_csv_path.exists():
+                self._paths["content_asset_full_csv"] = full_csv_path
             self._paths["content_asset_stats"] = stats
             return jsonl_path, csv_path, stats
         except Exception as e:
@@ -611,8 +614,19 @@ class DouyinScraper:
                     path = self.extract_scripts()
                     results["scripts_jsonl"] = str(path)
                 elif step_name == self.STEP_MERGE:
-                    path = self.merge()
-                    results["csv_path"] = str(path)
+                    outputs_dir = self._current_task_workspace_dir() / "outputs"
+                    jsonl_path, csv_path, stats = self.build_content_asset(
+                        search_outputs_dir=outputs_dir,
+                        comments_outputs_dir=outputs_dir,
+                        scripts_outputs_dir=outputs_dir,
+                    )
+                    results["content_asset_jsonl"] = str(jsonl_path)
+                    results["content_asset_csv"] = str(csv_path)
+                    full_csv_path = csv_path.with_name("content_asset_full.csv")
+                    if full_csv_path.exists():
+                        results["content_asset_full_csv"] = str(full_csv_path)
+                    results["content_asset_stats"] = stats
+                    results["csv_path"] = str(csv_path)
                 elif step_name == self.STEP_FFMPEG:
                     setup_ffmpeg()
                 elif step_name == self.STEP_WHISPER:
@@ -721,7 +735,7 @@ class DouyinScraper:
 
     def _content_asset_output_paths(self) -> Dict[str, Any]:
         return self._select_output_values(
-            path_keys=("content_asset_jsonl", "content_asset_csv"),
+            path_keys=("content_asset_jsonl", "content_asset_full_csv", "content_asset_csv"),
             stats_keys=("content_asset_stats",),
         )
 
@@ -2384,8 +2398,11 @@ class DouyinScraper:
             stats["rows_in"] = len(records)
             limit = max_items
             if limit is None:
+                configured_limit = getattr(self._config, "max_script_raw_items", None)
+                if configured_limit is None:
+                    configured_limit = getattr(self._config, "max_videos_per_keyword", 5)
                 try:
-                    limit = int(getattr(self._config, "max_script_raw_items", 5) or 5)
+                    limit = int(configured_limit)
                 except (TypeError, ValueError):
                     limit = 5
             limit = max(0, limit)

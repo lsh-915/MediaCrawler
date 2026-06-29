@@ -609,7 +609,14 @@ class TaskManager:
 
     @staticmethod
     def _run_all_result_names() -> tuple[str, ...]:
-        return ("search_result.csv", "search_result.jsonl")
+        return (
+            "content_asset_full.csv",
+            "content_asset.csv",
+            "content_asset.jsonl",
+            "douyin_koubo_data.csv",
+            "search_result.csv",
+            "search_result.jsonl",
+        )
 
 
     @staticmethod
@@ -636,6 +643,7 @@ class TaskManager:
     @staticmethod
     def _merge_result_names() -> tuple[str, ...]:
         return (
+            "content_asset_full.csv",
             "content_asset.csv",
             "content_asset.jsonl",
             "douyin_koubo_data.csv",
