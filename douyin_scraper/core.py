@@ -41,6 +41,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Union
 
 from douyin_scraper.config import ScraperConfig
+from douyin_scraper.completeness import filter_collectable_search_outputs
 from douyin_scraper.exceptions import (
     ConfigError,
     FatalError,
@@ -254,6 +255,14 @@ class DouyinScraper:
             self._prepare_script_source_outputs(
                 result_csv_path, result_jsonl_path, title_clean_csv
             )
+            filter_stats = filter_collectable_search_outputs(
+                result_csv_path.parent,
+                min_likes_threshold=self._config.min_likes_threshold,
+                force=self._config.force_recollect_complete,
+            )
+            self._paths["collection_filter_stats"] = filter_stats
+            self._paths["filtered_videos_csv"] = result_csv_path.parent / "filtered_videos.csv"
+            self._paths["filtered_videos_jsonl"] = result_csv_path.parent / "filtered_videos.jsonl"
 
             self._state.mark_step_completed(
                 step, detail=f"output={output_path}"
@@ -690,8 +699,13 @@ class DouyinScraper:
 
     def _search_output_paths(self) -> Dict[str, Any]:
         return self._select_output_values(
-            path_keys=("video_jsonl", "video_csv"),
-            stats_keys=("csv_stats",),
+            path_keys=(
+                "video_jsonl",
+                "video_csv",
+                "filtered_videos_jsonl",
+                "filtered_videos_csv",
+            ),
+            stats_keys=("csv_stats", "collection_filter_stats"),
         )
 
 

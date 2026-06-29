@@ -62,6 +62,8 @@ class ScraperConfig:
         self.keep_videos: bool = False
         self.max_workers: int = 1
         self.max_script_raw_items: Optional[int] = None
+        self.min_likes_threshold: int = 500
+        self.force_recollect_complete: bool = False
 
         # 加载配置
         if config is not None:
@@ -149,6 +151,16 @@ class ScraperConfig:
                         f"max_script_raw_items must be int: {value}",
                         step="config",
                     ) from e
+        if "min_likes_threshold" in data:
+            try:
+                self.min_likes_threshold = int(data["min_likes_threshold"])
+            except (ValueError, TypeError) as e:
+                raise ConfigError(
+                    f"min_likes_threshold must be int: {data.get('min_likes_threshold')}",
+                    step="config",
+                ) from e
+        if "force_recollect_complete" in data:
+            self.force_recollect_complete = bool(data["force_recollect_complete"])
         if "state_dir_name" in data:
             self.state_dir_name = str(data["state_dir_name"])
         if "retry" in data:
@@ -230,6 +242,8 @@ class ScraperConfig:
             errors.append("retry.max_attempts 必须 >= 1")
         if self.max_script_raw_items is not None and self.max_script_raw_items < 0:
             errors.append(f"max_script_raw_items must be >= 0, current: {self.max_script_raw_items}")
+        if self.min_likes_threshold < 0:
+            errors.append(f"min_likes_threshold must be >= 0, current: {self.min_likes_threshold}")
         if self.max_videos_per_keyword < 1:
             errors.append(f"max_videos_per_keyword 必须 >= 1, 当前: {self.max_videos_per_keyword}")
         if not isinstance(self.keywords, list):

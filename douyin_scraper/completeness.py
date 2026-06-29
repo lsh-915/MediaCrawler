@@ -14,6 +14,14 @@ REAL_SCRIPT_SOURCES = {"asr", "asr_raw", "subtitle", "caption", "ocr", "platform
 FALLBACK_SCRIPT_SOURCES = {"source_clean_title", "source_title_desc", "source_desc", "title"}
 COMMENTS_COMPLETE_STATUSES = {"success", "available", "no_more_comments"}
 COMMENTS_INCOMPLETE_STATUSES = {"failed", "partial", "error"}
+DATA_QUALITY_MESSAGES = {
+    "complete": "数据采集完整",
+    "incomplete": "采集不全，请补全",
+    "repairing": "正在补全缺失数据",
+    "partial": "已补全部分数据，仍有缺失",
+    "failed": "数据检查失败，请查看错误",
+}
+DEFAULT_MIN_LIKES_THRESHOLD = 500
 
 
 VIDEO_STATUS_FIELDNAMES = [
@@ -21,6 +29,12 @@ VIDEO_STATUS_FIELDNAMES = [
     "video_id",
     "aweme_url",
     "source_task_id",
+    "source_keyword",
+    "platform",
+    "liked_count",
+    "comment_count",
+    "share_count",
+    "favorite_count",
     "search_status",
     "comments_status",
     "script_raw_status",
@@ -60,6 +74,10 @@ def _safe_int(value: Any) -> int:
         return 0
 
 
+def _bool_status(value: str) -> bool:
+    return value == "complete"
+
+
 def _read_csv(path: Path) -> List[Dict[str, Any]]:
     if not path.exists():
         return []
@@ -83,6 +101,31 @@ def _read_jsonl(path: Path) -> List[Dict[str, Any]]:
             if isinstance(value, dict):
                 rows.append(value)
     return rows
+
+
+def _read_json(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _write_jsonl(path: Path, rows: Sequence[Dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(str(path), "w", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def _write_csv(path: Path, rows: Sequence[Dict[str, Any]], fieldnames: Sequence[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(str(path), "w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(fieldnames), extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def _load_rows(output_dir: Path, stem: str) -> List[Dict[str, Any]]:
@@ -261,6 +304,31 @@ def _dedupe(values: Iterable[str]) -> List[str]:
     return result
 
 
+def data_quality_summary(report: Dict[str, Any]) -> Dict[str, Any]:
+    """Return task-level quality status and recommended repair dimensions."""
+    dimensions = report.get("dimensions") or {}
+    videos_total = int(report.get("videos_total", 0) or 0)
+    videos_incomplete = int(report.get("videos_incomplete", 0) or 0)
+    recommended = [
+        name
+        for name in ("comments", "scripts", "content_asset")
+        if int((dimensions.get(name) or {}).get("incomplete", 0) or 0) > 0
+    ]
+    if videos_total <= 0:
+        status = "failed"
+    elif videos_incomplete <= 0:
+        status = "complete"
+    else:
+        status = "incomplete"
+    return {
+        "data_quality_status": status,
+        "message": DATA_QUALITY_MESSAGES[status],
+        "data_quality_message": DATA_QUALITY_MESSAGES[status],
+        "repair_available": status == "incomplete" and bool(recommended),
+        "recommended_repair_dimensions": recommended,
+    }
+
+
 def _comment_counts(comments_clean_rows: Sequence[Dict[str, Any]]) -> Dict[str, int]:
     counts: Dict[str, int] = {}
     for row in comments_clean_rows:
@@ -364,6 +432,12 @@ def build_task_completeness_report(task_workspace: Path, task_id: Optional[str] 
             "video_id": _text(source_row.get("video_id")) or _text(source_row.get("aweme_id")),
             "aweme_url": _text(source_row.get("aweme_url")) or _text(source_row.get("video_url")),
             "source_task_id": source_task_id,
+            "source_keyword": _text(source_row.get("source_keyword")),
+            "platform": _text(source_row.get("platform")) or "douyin",
+            "liked_count": _safe_int(source_row.get("liked_count") or source_row.get("likes")),
+            "comment_count": _safe_int(source_row.get("comment_count") or source_row.get("comments_count")),
+            "share_count": _safe_int(source_row.get("share_count") or source_row.get("shares")),
+            "favorite_count": _safe_int(source_row.get("collected_count") or source_row.get("favorites")),
             "search_status": search_status,
             "comments_status": comments_status,
             "script_raw_status": script_raw_status,
@@ -391,8 +465,10 @@ def build_task_completeness_report(task_workspace: Path, task_id: Optional[str] 
         "videos_incomplete": len(videos) - videos_complete,
         "dimensions": dimension_counts,
         "incomplete_reasons": dict(sorted(reason_counts.items())),
+        "collection_filter_stats": _read_json(output_dir / "collection_filter_stats.json"),
         "videos": videos,
     }
+    report.update(data_quality_summary(report))
     return report
 
 
@@ -434,6 +510,214 @@ def write_task_completeness_report(task_workspace: Path, task_id: Optional[str] 
         "completeness_video_status_csv": str(csv_path),
     }
     return report
+
+
+def _default_index_path(task_workspace: Path) -> Path:
+    workspace = Path(task_workspace).resolve()
+    if workspace.parent.name == "workspaces":
+        return workspace.parent.parent / "data" / "cache" / "video_completeness_index.jsonl"
+    return Path.cwd() / "data" / "cache" / "video_completeness_index.jsonl"
+
+
+def load_video_completeness_index(index_path: Path) -> Dict[str, Dict[str, Any]]:
+    """Load the global video completeness index keyed by aweme/video id."""
+    index: Dict[str, Dict[str, Any]] = {}
+    for row in _read_jsonl(Path(index_path)):
+        key = _text(row.get("aweme_id")) or _text(row.get("video_id"))
+        if key:
+            index[key] = row
+    return index
+
+
+def update_video_completeness_index(
+    task_workspace: Path,
+    task_id: Optional[str] = None,
+    index_path: Optional[Path] = None,
+    report: Optional[Dict[str, Any]] = None,
+) -> Path:
+    """Merge a task completeness report into the global completeness index."""
+    workspace = Path(task_workspace)
+    target = Path(index_path) if index_path is not None else _default_index_path(workspace)
+    existing = load_video_completeness_index(target)
+    report_data = report or write_task_completeness_report(workspace, task_id=task_id)
+    generated_at = _text(report_data.get("generated_at")) or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    current_task_id = task_id or _text(report_data.get("task_id")) or workspace.name
+
+    for row in report_data.get("videos", []):
+        key = _text(row.get("aweme_id")) or _text(row.get("video_id"))
+        if not key:
+            continue
+        is_complete = bool(row.get("is_complete"))
+        previous = dict(existing.get(key) or {})
+        indexed = {
+            **previous,
+            "aweme_id": key,
+            "video_id": _text(row.get("video_id")) or key,
+            "platform": _text(row.get("platform")) or previous.get("platform") or "douyin",
+            "latest_workspace": str(workspace),
+            "search_complete": _bool_status(_text(row.get("search_status"))),
+            "comments_complete": _bool_status(_text(row.get("comments_status"))),
+            "scripts_complete": (
+                _bool_status(_text(row.get("script_raw_status")))
+                and _bool_status(_text(row.get("script_clean_status")))
+            ),
+            "content_asset_complete": _bool_status(_text(row.get("content_asset_status"))),
+            "is_complete": is_complete,
+            "updated_at": generated_at,
+            "source_keyword": _text(row.get("source_keyword")) or previous.get("source_keyword", ""),
+            "liked_count": _safe_int(row.get("liked_count") or previous.get("liked_count")),
+            "comment_count": _safe_int(row.get("comment_count") or previous.get("comment_count")),
+            "share_count": _safe_int(row.get("share_count") or previous.get("share_count")),
+            "favorite_count": _safe_int(row.get("favorite_count") or previous.get("favorite_count")),
+        }
+        if is_complete:
+            indexed["latest_complete_task_id"] = current_task_id
+            indexed["last_complete_at"] = generated_at
+        existing[key] = indexed
+
+    rows = sorted(existing.values(), key=lambda item: str(item.get("aweme_id", "")))
+    _write_jsonl(target, rows)
+    return target
+
+
+def filter_collectable_search_outputs(
+    output_dir: Path,
+    *,
+    min_likes_threshold: int = DEFAULT_MIN_LIKES_THRESHOLD,
+    index_path: Optional[Path] = None,
+    force: bool = False,
+) -> Dict[str, Any]:
+    """Filter search/script source outputs before comments/scripts/content_asset collection."""
+    output = Path(output_dir)
+    search_csv = output / "search_result.csv"
+    search_jsonl = output / "search_result.jsonl"
+    if not search_csv.exists():
+        return {
+            "min_likes_threshold": min_likes_threshold,
+            "videos_total_from_search": 0,
+            "videos_filtered_low_likes": 0,
+            "videos_after_likes_filter": 0,
+            "skipped_already_complete": 0,
+            "new_videos_to_collect": 0,
+            "incomplete_videos_to_repair": 0,
+            "filter_applied": False,
+        }
+
+    search_rows = _read_csv(search_csv)
+    search_json_rows = _read_jsonl(search_jsonl)
+    index = load_video_completeness_index(index_path or _default_index_path(output.parent))
+    filtered: List[Dict[str, Any]] = []
+    kept: List[Dict[str, Any]] = []
+    skipped_complete = 0
+    incomplete_history = 0
+    new_count = 0
+
+    for row in search_rows:
+        key = _text(row.get("aweme_id")) or _text(row.get("video_id"))
+        likes = _safe_int(row.get("liked_count") or row.get("likes"))
+        if min_likes_threshold > 0 and likes < min_likes_threshold:
+            filtered.append({
+                **row,
+                "filter_reason": "low_likes",
+                "threshold": min_likes_threshold,
+            })
+            continue
+        indexed = index.get(key) if key else None
+        if indexed and indexed.get("is_complete") and not force:
+            skipped_complete += 1
+            filtered.append({
+                **row,
+                "filter_reason": "already_complete",
+                "threshold": min_likes_threshold,
+                "latest_complete_task_id": indexed.get("latest_complete_task_id", ""),
+            })
+            continue
+        if indexed and not indexed.get("is_complete"):
+            incomplete_history += 1
+        else:
+            new_count += 1
+        kept.append(row)
+
+    def _keep_json_row(row: Dict[str, Any]) -> bool:
+        key = _text(row.get("aweme_id")) or _text(row.get("video_id"))
+        return any((_text(item.get("aweme_id")) or _text(item.get("video_id"))) == key for item in kept)
+
+    if search_json_rows:
+        original_json = output / "search_result_all.jsonl"
+        if not original_json.exists():
+            search_jsonl.replace(original_json)
+        else:
+            search_jsonl.unlink(missing_ok=True)
+        _write_jsonl(search_jsonl, [row for row in search_json_rows if _keep_json_row(row)])
+    original_csv = output / "search_result_all.csv"
+    if not original_csv.exists():
+        search_csv.replace(original_csv)
+    _write_csv(search_csv, kept, search_rows[0].keys() if search_rows else [])
+
+    script_sources_csv = output / "script_sources.csv"
+    script_sources_jsonl = output / "script_sources.jsonl"
+    if script_sources_csv.exists():
+        source_rows = _read_csv(script_sources_csv)
+        kept_keys = {_text(row.get("aweme_id")) or _text(row.get("video_id")) for row in kept}
+        kept_sources = [
+            row for row in source_rows
+            if (_text(row.get("aweme_id")) or _text(row.get("video_id"))) in kept_keys
+        ]
+        original_sources_csv = output / "script_sources_all.csv"
+        if not original_sources_csv.exists():
+            script_sources_csv.replace(original_sources_csv)
+        _write_csv(script_sources_csv, kept_sources, source_rows[0].keys() if source_rows else [])
+        if script_sources_jsonl.exists():
+            source_json_rows = _read_jsonl(script_sources_jsonl)
+            original_sources_jsonl = output / "script_sources_all.jsonl"
+            if not original_sources_jsonl.exists():
+                script_sources_jsonl.replace(original_sources_jsonl)
+            else:
+                script_sources_jsonl.unlink(missing_ok=True)
+            _write_jsonl(
+                script_sources_jsonl,
+                [
+                    row for row in source_json_rows
+                    if (_text(row.get("aweme_id")) or _text(row.get("video_id"))) in kept_keys
+                ],
+            )
+
+    filtered_csv = output / "filtered_videos.csv"
+    filtered_jsonl = output / "filtered_videos.jsonl"
+    if filtered:
+        fieldnames = list(dict.fromkeys(
+            list(search_rows[0].keys() if search_rows else [])
+            + ["filter_reason", "threshold", "latest_complete_task_id"]
+        ))
+        _write_csv(filtered_csv, filtered, fieldnames)
+        _write_jsonl(filtered_jsonl, filtered)
+    else:
+        _write_csv(filtered_csv, [], ["aweme_id", "video_id", "liked_count", "filter_reason", "threshold"])
+        _write_jsonl(filtered_jsonl, [])
+
+    stats = {
+        "min_likes_threshold": min_likes_threshold,
+        "videos_total_from_search": len(search_rows),
+        "videos_filtered_low_likes": sum(1 for row in filtered if row.get("filter_reason") == "low_likes"),
+        "videos_after_likes_filter": len(search_rows) - sum(1 for row in filtered if row.get("filter_reason") == "low_likes"),
+        "skipped_already_complete": skipped_complete,
+        "new_videos_to_collect": new_count,
+        "incomplete_videos_to_repair": incomplete_history,
+        "videos_to_collect": len(kept),
+        "filtered_total": len(filtered),
+        "filter_applied": True,
+        "files": {
+            "filtered_videos_csv": str(filtered_csv),
+            "filtered_videos_jsonl": str(filtered_jsonl),
+            "search_result_all_csv": str(output / "search_result_all.csv"),
+            "search_result_all_jsonl": str(output / "search_result_all.jsonl"),
+        },
+    }
+    (output / "collection_filter_stats.json").write_text(
+        json.dumps(stats, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return stats
 
 
 def load_video_completeness(task_workspace: Path) -> List[Dict[str, Any]]:
