@@ -80,6 +80,8 @@ class SearchRequest(BaseModel):
     """搜索采集请求"""
     keywords: List[str] = Field(..., description="搜索关键词列表")
     max_count: int = Field(20, description="每个关键词最大采集数", ge=1, le=200)
+    min_likes_threshold: int = Field(500, description="min likes threshold", ge=0)
+    force: bool = Field(False, description="ignore complete history index")
     project_dir: Optional[str] = Field(None, description="工作目录（默认自动创建）")
 
     @field_validator("keywords")
@@ -153,6 +155,8 @@ class RunAllRequest(BaseModel):
     """一键运行请求"""
     keywords: List[str] = Field(..., description="搜索关键词列表")
     max_count: int = Field(20, description="每个关键词最大采集数")
+    min_likes_threshold: int = Field(500, description="min likes threshold", ge=0)
+    force: bool = Field(False, description="ignore complete history index")
     steps: Optional[List[str]] = Field(None, description="指定步骤（默认全部）")
     project_dir: Optional[str] = Field(None, description="工作目录")
 
@@ -254,6 +258,9 @@ def _search_output_result(paths: Dict[str, Any], output: Path) -> Dict[str, Any]
         "video_jsonl": paths.get("video_jsonl", str(output)),
         "video_csv": paths.get("video_csv", ""),
         "csv_stats": paths.get("csv_stats", {}),
+        "filtered_videos_jsonl": paths.get("filtered_videos_jsonl", ""),
+        "filtered_videos_csv": paths.get("filtered_videos_csv", ""),
+        "collection_filter_stats": paths.get("collection_filter_stats", {}),
     }
 
 
@@ -752,6 +759,8 @@ async def search(req: SearchRequest) -> Dict[str, Any]:
     def _do_search() -> Dict[str, Any]:
         logger.info("API search request task_id=%s keywords=%r", task.task_id, req.keywords)
         scraper = _make_scraper(req.project_dir, task.workspace)
+        scraper.config.min_likes_threshold = req.min_likes_threshold
+        scraper.config.force_recollect_complete = req.force
         output = scraper.search(keywords=req.keywords, max_count=req.max_count)
         paths = scraper.get_paths()
         result = _search_output_result(paths, output)
@@ -999,6 +1008,8 @@ async def run_all(req: RunAllRequest) -> Dict[str, Any]:
         scraper = _make_scraper(req.project_dir, task.workspace)
         scraper.config.keywords = req.keywords
         scraper.config.max_videos_per_keyword = req.max_count
+        scraper.config.min_likes_threshold = req.min_likes_threshold
+        scraper.config.force_recollect_complete = req.force
         result = scraper.run_all(steps=req.steps)
         if result.get("error"):
             error = str(result.get("error") or "run_all failed")
@@ -1049,6 +1060,8 @@ async def resume_task(req: ResumeRequest) -> Dict[str, Any]:
         "source_task_id": req.source_task_id,
         "status": "submitted",
         "type": "resume",
+        "data_quality_status": "repairing",
+        "data_quality_message": "正在补全缺失数据",
         "planned": plan["planned"],
         "skipped": plan["skipped"],
         "videos_total": source_report.get("videos_total", 0),

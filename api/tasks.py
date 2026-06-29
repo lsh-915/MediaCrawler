@@ -139,6 +139,10 @@ class TaskInfo:
         self.exit_code: int = 0
         self.result: Optional[Dict[str, Any]] = None
         self.progress: str = ""
+        self.data_quality_status: Optional[str] = None
+        self.data_quality_message: Optional[str] = None
+        self.repair_available: bool = False
+        self.recommended_repair_dimensions: List[str] = []
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -154,6 +158,10 @@ class TaskInfo:
             "exit_code": self.exit_code,
             "result": self.result,
             "progress": self.progress,
+            "data_quality_status": self.data_quality_status,
+            "data_quality_message": self.data_quality_message,
+            "repair_available": self.repair_available,
+            "recommended_repair_dimensions": self.recommended_repair_dimensions,
         }
 
     @classmethod
@@ -172,6 +180,10 @@ class TaskInfo:
         task.exit_code = data.get("exit_code", 0)
         task.result = data.get("result")
         task.progress = data.get("progress", "")
+        task.data_quality_status = data.get("data_quality_status")
+        task.data_quality_message = data.get("data_quality_message")
+        task.repair_available = bool(data.get("repair_available", False))
+        task.recommended_repair_dimensions = list(data.get("recommended_repair_dimensions") or [])
         return task
 
 
@@ -322,6 +334,68 @@ class TaskManager:
             close_log_handlers_under(workspace_path)
         except OSError:
             pass
+
+    def _attach_data_quality(self, task: TaskInfo, result: Dict[str, Any]) -> Dict[str, Any]:
+        """Best-effort completeness report/index update after a task finishes."""
+        output_dir = Path(task.workspace) / "outputs"
+        if not output_dir.exists():
+            return result
+        has_quality_input = any(
+            (output_dir / name).exists()
+            for name in (
+                "search_result.csv",
+                "content_asset.csv",
+                "content_asset_full.csv",
+                "content_asset.jsonl",
+            )
+        )
+        if not has_quality_input:
+            return result
+
+        try:
+            from douyin_scraper.completeness import (
+                update_video_completeness_index,
+                write_task_completeness_report,
+            )
+
+            report = write_task_completeness_report(Path(task.workspace), task_id=task.task_id)
+            index_path = update_video_completeness_index(
+                Path(task.workspace),
+                task_id=task.task_id,
+                report=report,
+            )
+            task.data_quality_status = str(report.get("data_quality_status") or "")
+            task.data_quality_message = str(report.get("data_quality_message") or report.get("message") or "")
+            task.repair_available = bool(report.get("repair_available"))
+            task.recommended_repair_dimensions = list(report.get("recommended_repair_dimensions") or [])
+            result.update({
+                "data_quality_status": task.data_quality_status,
+                "data_quality_message": task.data_quality_message,
+                "repair_available": task.repair_available,
+                "recommended_repair_dimensions": task.recommended_repair_dimensions,
+                "completeness_report": report.get("files", {}).get("completeness_report", ""),
+                "video_completeness_index": str(index_path),
+                "completeness": {
+                    "videos_total": report.get("videos_total", 0),
+                    "videos_complete": report.get("videos_complete", 0),
+                    "videos_incomplete": report.get("videos_incomplete", 0),
+                    "dimensions": report.get("dimensions", {}),
+                    "incomplete_reasons": report.get("incomplete_reasons", {}),
+                },
+            })
+        except Exception as exc:
+            task.data_quality_status = "failed"
+            task.data_quality_message = f"数据检查失败，请查看错误: {str(exc)[:200]}"
+            task.repair_available = False
+            task.recommended_repair_dimensions = []
+            result.update({
+                "data_quality_status": task.data_quality_status,
+                "data_quality_message": task.data_quality_message,
+                "repair_available": False,
+                "recommended_repair_dimensions": [],
+            })
+            logger.warning("data quality check failed for task %s: %s", task.task_id, exc)
+        return result
 
     def _register_shutdown_handlers(self) -> None:
         """
@@ -486,10 +560,12 @@ class TaskManager:
 
                 try:
                     result = func(*args, **kwargs)
+                    result_dict = result if isinstance(result, dict) else {"output": str(result)}
+                    result_dict = self._attach_data_quality(task, result_dict)
                     with self._lock:
                         task.status = "completed"
                         task.completed_at = _now_iso()
-                        task.result = result if isinstance(result, dict) else {"output": str(result)}
+                        task.result = result_dict
                         self._save_registry()
                     logger.info("任务完成: %s", task.task_id)
                     self._broadcast("task_completed", task)
