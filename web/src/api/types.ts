@@ -11,6 +11,54 @@ export interface TaskInfo {
   exit_code: number;
   result: Record<string, any> | null;
   progress: string;
+  data_quality_status?: DataQualityStatus | null;
+  data_quality_message?: string | null;
+  repair_available?: boolean;
+  recommended_repair_dimensions?: RepairDimension[];
+}
+
+export type DataQualityStatus = 'complete' | 'incomplete' | 'repairing' | 'partial' | 'failed';
+export type RepairDimension = 'comments' | 'scripts' | 'content_asset';
+
+export interface CompletenessReport {
+  task_id: string;
+  data_quality_status: DataQualityStatus;
+  message?: string;
+  data_quality_message?: string;
+  videos_total: number;
+  videos_complete: number;
+  videos_incomplete: number;
+  dimensions: Record<string, { complete: number; incomplete: number }>;
+  incomplete_reasons?: Record<string, number>;
+  repair_available: boolean;
+  recommended_repair_dimensions: RepairDimension[];
+  collection_filter_stats?: Record<string, any>;
+}
+
+export interface ResumeTaskRequest {
+  source_task_id: string;
+  dimensions: RepairDimension[];
+  skip_complete?: boolean;
+  force?: boolean;
+  max_count?: number;
+  max_comments_per_video?: number;
+  model?: string;
+}
+
+export interface ResumeTaskResponse {
+  repair_task_id: string;
+  task_id: string;
+  source_task_id: string;
+  status: string;
+  type: string;
+  data_quality_status?: DataQualityStatus;
+  data_quality_message?: string;
+  planned: Record<RepairDimension, number>;
+  skipped: Record<RepairDimension, number>;
+  videos_total?: number;
+  videos_complete?: number;
+  videos_incomplete?: number;
+  incomplete_reasons?: Record<string, number>;
 }
 
 export interface TaskStats {

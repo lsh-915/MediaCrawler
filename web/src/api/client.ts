@@ -6,6 +6,7 @@ import type {
   TaskListResponse, TaskInfo, CreateTaskResponse, HealthResponse,
   SearchParams, CommentsParams, ScriptsParams, MergeParams, RunAllParams,
   DataListResponse, DataPreviewResponse, ExportRequest,
+  CompletenessReport, ResumeTaskRequest, ResumeTaskResponse,
 } from './types';
 
 function getApiKey(): string {
@@ -90,6 +91,14 @@ export const api = {
 
   getTaskStatus: (taskId: string) =>
     getClient().get(`scrape/status/${taskId}`).json<TaskInfo>(),
+
+  checkCompleteness: (taskId: string) =>
+    getClient().get('scrape/data/completeness', {
+      searchParams: { task_id: taskId },
+    }).json<CompletenessReport>(),
+
+  resumeTask: (data: ResumeTaskRequest) =>
+    getClient().post('scrape/resume', { json: data }).json<ResumeTaskResponse>(),
 
   deleteTask: (taskId: string) =>
     getClient().delete(`scrape/tasks/${taskId}`).json(),
