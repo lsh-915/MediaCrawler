@@ -57,9 +57,24 @@ def _now_iso() -> str:
 
 def _safe_log(level: str, msg: str, *args: Any) -> None:
     """Best-effort logging for shutdown/atexit paths after pytest closes streams."""
-    stream = getattr(sys, "stdout", None)
-    if stream is None or getattr(stream, "closed", False):
+    stdout = getattr(sys, "stdout", None)
+    stderr = getattr(sys, "stderr", None)
+    if (
+        stdout is None
+        or stderr is None
+        or getattr(stdout, "closed", False)
+        or getattr(stderr, "closed", False)
+    ):
         return
+    current: Optional[logging.Logger] = logger
+    while current is not None:
+        for handler in current.handlers:
+            handler_stream = getattr(handler, "stream", None)
+            if handler_stream is not None and getattr(handler_stream, "closed", False):
+                return
+        if not current.propagate:
+            break
+        current = current.parent
     try:
         getattr(logger, level)(msg, *args)
     except (ValueError, OSError, AttributeError):
@@ -647,6 +662,15 @@ class TaskManager:
             "content_asset.csv",
             "content_asset.jsonl",
             "douyin_koubo_data.csv",
+        )
+
+    @staticmethod
+    def _resume_result_names() -> tuple[str, ...]:
+        return (
+            "content_asset_full.csv",
+            "content_asset.csv",
+            "content_asset.jsonl",
+            "completeness_report.json",
         )
 
     @classmethod
