@@ -384,9 +384,34 @@ function DataQualitySection({
     || task.result?.data_quality_message
     || (status === 'complete' ? '数据采集完整' : '采集不全，请补全');
   const filterStats = quality?.collection_filter_stats || task.result?.collection_filter_stats || {};
+  const eligibility = filterStats.eligibility || task.result?.eligibility || {};
+  const statValue = (key: string) => eligibility[key] ?? filterStats[key] ?? 0;
+  const filterSummary = [
+    ['eligible_videos', '可采视频'],
+    ['filtered_total', '过滤总数'],
+    ['filtered_low_likes', '低赞过滤'],
+    ['filtered_missing_likes', '缺赞过滤'],
+    ['filtered_not_video', '非视频'],
+    ['filtered_note_post', '图文作品'],
+    ['filtered_missing_video_url', '缺视频地址'],
+    ['filtered_zero_duration', '零时长'],
+    ['filtered_audio_only', '音频作品'],
+    ['filtered_region_title', '地域标题'],
+    ['filtered_non_mandarin', '非普通话'],
+    ['filtered_asr_too_short', 'ASR 过短'],
+    ['filtered_asr_language_not_zh', '非中文 ASR'],
+    ['skipped_already_complete', '历史完整跳过'],
+  ] as const;
   const missingScripts = dimensions.scripts?.incomplete ?? 0;
   const missingComments = dimensions.comments?.incomplete ?? 0;
   const missingAssets = dimensions.content_asset?.incomplete ?? 0;
+  const isRecoveryMode = task.status === 'failed';
+  const canRepair = Boolean(
+    repairing
+    || quality?.repair_available
+    || task.repair_available
+    || recommendedDimensions.length > 0
+  );
 
   const handleCheck = async () => {
     setChecking(true);
@@ -440,7 +465,7 @@ function DataQualitySection({
   };
 
   useEffect(() => {
-    if (task.status !== 'completed' || quality || checking || initialStatus) return;
+    if (!['completed', 'failed'].includes(task.status) || quality || checking || initialStatus) return;
     void handleCheck();
   }, [task.status, task.task_id]);
 
@@ -472,7 +497,7 @@ function DataQualitySection({
     'warning';
 
   return (
-    <Card sx={{ mb: 3, border: '1px solid #90a4ae' }}>
+    <Card id={isRecoveryMode ? 'task-recovery-panel' : undefined} sx={{ mb: 3, border: '1px solid #90a4ae' }}>
       <CardContent>
         <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 2, mb: 1.5, flexWrap: 'wrap' }}>
           <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
@@ -482,7 +507,7 @@ function DataQualitySection({
               <ErrorOutlineIcon color={severity === 'error' ? 'error' : 'warning'} />
             )}
             <Typography variant="subtitle1" fontWeight={700}>
-              数据完整性检查
+              {isRecoveryMode ? '继续处理' : '数据完整性检查'}
             </Typography>
           </Box>
           <Chip
@@ -492,6 +517,12 @@ function DataQualitySection({
             variant="outlined"
           />
         </Box>
+
+        {isRecoveryMode && (
+          <Alert severity="info" sx={{ mb: 1.5 }}>
+            已产出的搜索、评论和中间文件会被复用。可以先检查完整性，再补全文案或内容资产。
+          </Alert>
+        )}
 
         <Box sx={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(120px, 1fr))', gap: 1, mb: 2 }}>
           <Paper variant="outlined" sx={{ p: 1 }}>
@@ -506,14 +537,12 @@ function DataQualitySection({
             <Typography variant="caption" color="text.secondary">内容资产缺失</Typography>
             <Typography variant="body2" fontWeight={700}>{missingAssets}</Typography>
           </Paper>
-          <Paper variant="outlined" sx={{ p: 1 }}>
-            <Typography variant="caption" color="text.secondary">低赞过滤</Typography>
-            <Typography variant="body2" fontWeight={700}>{filterStats.videos_filtered_low_likes ?? 0}</Typography>
-          </Paper>
-          <Paper variant="outlined" sx={{ p: 1 }}>
-            <Typography variant="caption" color="text.secondary">历史完整跳过</Typography>
-            <Typography variant="body2" fontWeight={700}>{filterStats.skipped_already_complete ?? 0}</Typography>
-          </Paper>
+          {filterSummary.map(([key, label]) => (
+            <Paper variant="outlined" sx={{ p: 1 }} key={key}>
+              <Typography variant="caption" color="text.secondary">{label}</Typography>
+              <Typography variant="body2" fontWeight={700}>{statValue(key)}</Typography>
+            </Paper>
+          ))}
         </Box>
 
         {repairTaskId && (
@@ -537,7 +566,7 @@ function DataQualitySection({
           >
             {checking ? '检查中...' : '检查完整性'}
           </Button>
-          {status !== 'complete' && (
+          {status !== 'complete' && canRepair && (
             <Button
               size="small"
               variant="contained"
@@ -564,7 +593,15 @@ function DataQualitySection({
   );
 }
 
-function ErrorSection({ error, exitCode }: { error: string; exitCode: number }) {
+function ErrorSection({
+  error,
+  exitCode,
+  canRecover = false,
+}: {
+  error: string;
+  exitCode: number;
+  canRecover?: boolean;
+}) {
   const [showRaw, setShowRaw] = useState(false);
 
   const exitCodeLabel: Record<number, { label: string; color: 'warning' | 'error' | 'info' }> = {
@@ -601,6 +638,25 @@ function ErrorSection({ error, exitCode }: { error: string; exitCode: number }) 
           <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
             容器重启或进程退出导致任务中断。已采集的数据保存在 workspace 中，可以重新执行任务。
           </Typography>
+        )}
+
+        {isInterrupted && canRecover && (
+          <Alert
+            severity="info"
+            sx={{ mb: 1.5 }}
+            action={(
+              <Button
+                color="inherit"
+                size="small"
+                startIcon={<PlayArrowIcon />}
+                onClick={() => document.getElementById('task-recovery-panel')?.scrollIntoView({ behavior: 'smooth', block: 'start' })}
+              >
+                去继续处理
+              </Button>
+            )}
+          >
+            已采集的数据不会丢失。使用“继续处理”里的检查完整性和补全缺失数据，可以从已有结果继续。
+          </Alert>
         )}
 
         <Typography variant="body2" color={isInterrupted ? 'text.primary' : 'error.main'} sx={{ mb: 1 }}>
@@ -695,6 +751,7 @@ export default function TaskDetailPage() {
   const isRunning = currentTask.status === 'running';
   const isFailed  = currentTask.status === 'failed';
   const isDone    = currentTask.status === 'completed';
+  const canRecoverFailedTask = isFailed && ['run_all', 'resume'].includes(currentTask.task_type);
 
   return (
     <Box>
@@ -761,6 +818,14 @@ export default function TaskDetailPage() {
                   {typeLabel}
                 </Typography>
                 <StatusBadge status={currentTask.status} />
+                {canRecoverFailedTask && (
+                  <Chip
+                    label="可继续处理"
+                    size="small"
+                    color="warning"
+                    variant="outlined"
+                  />
+                )}
                 {isRunning && elapsed && (
                   <Chip
                     icon={<HourglassTopIcon sx={{ fontSize: '14px !important' }} />}
@@ -995,10 +1060,21 @@ export default function TaskDetailPage() {
             </Box>
           )}
 
+          {canRecoverFailedTask && (
+            <DataQualitySection
+              task={currentTask}
+              onRefreshTask={() => taskId && fetchTaskDetail(taskId)}
+            />
+          )}
+
           {/* 错误 */}
           {isFailed && currentTask.error && (
             <Box sx={{ mb: 3 }}>
-              <ErrorSection error={currentTask.error} exitCode={currentTask.exit_code} />
+              <ErrorSection
+                error={currentTask.error}
+                exitCode={currentTask.exit_code}
+                canRecover={canRecoverFailedTask}
+              />
             </Box>
           )}
 

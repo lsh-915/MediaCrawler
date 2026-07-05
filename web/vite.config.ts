@@ -1,5 +1,22 @@
-import { defineConfig, loadEnv } from 'vite';
+import { defineConfig, loadEnv, type Plugin } from 'vite';
 import react from '@vitejs/plugin-react';
+
+function devBaseRedirectPlugin(): Plugin {
+  return {
+    name: 'dev-base-redirect',
+    configureServer(server) {
+      server.middlewares.use((req, res, next) => {
+        if (req.url === '/' || req.url === '/index.html' || req.url === '/ui') {
+          res.statusCode = 302;
+          res.setHeader('Location', '/ui/');
+          res.end();
+          return;
+        }
+        next();
+      });
+    },
+  };
+}
 
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), '');
@@ -8,11 +25,16 @@ export default defineConfig(({ mode }) => {
   const devPort = Number(env.WEB_DEV_PORT || 15173);
 
   return {
-    plugins: [react()],
+    plugins: [devBaseRedirectPlugin(), react()],
     base: '/ui/',
     build: {
       outDir: '../api/webui',
       emptyOutDir: true,
+      rollupOptions: {
+        input: {
+          index: './index.html',
+        },
+      },
     },
     server: {
       port: devPort,
