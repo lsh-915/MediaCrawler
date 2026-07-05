@@ -41,7 +41,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Union
 
 from douyin_scraper.config import ScraperConfig
-from douyin_scraper.completeness import filter_collectable_search_outputs
+from douyin_scraper.completeness import (
+    filter_collectable_search_outputs,
+    filter_script_raw_mandarin_outputs,
+)
 from douyin_scraper.exceptions import (
     ConfigError,
     FatalError,
@@ -259,10 +262,16 @@ class DouyinScraper:
                 result_csv_path.parent,
                 min_likes_threshold=self._config.min_likes_threshold,
                 force=self._config.force_recollect_complete,
+                enable_region_title_filter=self._config.enable_region_title_filter,
+                skip_already_complete=self._config.skip_already_complete,
             )
             self._paths["collection_filter_stats"] = filter_stats
             self._paths["filtered_videos_csv"] = result_csv_path.parent / "filtered_videos.csv"
             self._paths["filtered_videos_jsonl"] = result_csv_path.parent / "filtered_videos.jsonl"
+            self._paths["eligible_videos_csv"] = result_csv_path.parent / "eligible_videos.csv"
+            self._paths["eligible_videos_jsonl"] = result_csv_path.parent / "eligible_videos.jsonl"
+            self._paths["skipped_videos_csv"] = result_csv_path.parent / "skipped_videos.csv"
+            self._paths["skipped_videos_jsonl"] = result_csv_path.parent / "skipped_videos.jsonl"
 
             self._state.mark_step_completed(
                 step, detail=f"output={output_path}"
@@ -478,6 +487,12 @@ class DouyinScraper:
                 model_name=model,
                 max_items=max_items,
             )
+            asr_filter_stats = filter_script_raw_mandarin_outputs(
+                raw_csv.parent,
+                min_asr_text_length=self._config.min_asr_text_length,
+                enabled=self._config.enable_mandarin_filter,
+            )
+            stats["asr_mandarin_filter"] = asr_filter_stats
             clean_jsonl, clean_csv, clean_stats = self._do_build_script_clean(
                 script_sources_jsonl=script_sources_jsonl,
                 script_sources_csv=script_sources_csv,
@@ -585,6 +600,8 @@ class DouyinScraper:
                     else None
                 ),
                 output_dir=output_dir,
+                content_asset_comments_limit=self._config.content_asset_comments_limit,
+                content_asset_full_comments_limit=self._config.content_asset_full_comments_limit,
             )
             self._state.mark_step_completed(step, detail=f"output={csv_path}")
             self._paths["content_asset_jsonl"] = jsonl_path
@@ -702,8 +719,12 @@ class DouyinScraper:
             path_keys=(
                 "video_jsonl",
                 "video_csv",
+                "eligible_videos_jsonl",
+                "eligible_videos_csv",
                 "filtered_videos_jsonl",
                 "filtered_videos_csv",
+                "skipped_videos_jsonl",
+                "skipped_videos_csv",
             ),
             stats_keys=("csv_stats", "collection_filter_stats"),
         )

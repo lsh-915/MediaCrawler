@@ -90,6 +90,7 @@ def test_filter_collectable_search_outputs_low_likes_and_complete_history(tmp_pa
     assert stats["videos_total_from_search"] == 4
     assert stats["videos_filtered_low_likes"] == 1
     assert stats["skipped_already_complete"] == 1
+    assert stats["eligible_videos"] == 2
     assert stats["new_videos_to_collect"] == 1
     assert stats["incomplete_videos_to_repair"] == 1
     kept = list(csv.DictReader(open(outputs / "search_result.csv", encoding="utf-8-sig")))
@@ -97,7 +98,11 @@ def test_filter_collectable_search_outputs_low_likes_and_complete_history(tmp_pa
     sources = list(csv.DictReader(open(outputs / "script_sources.csv", encoding="utf-8-sig")))
     assert [row["aweme_id"] for row in sources] == ["new", "incomplete"]
     filtered = list(csv.DictReader(open(outputs / "filtered_videos.csv", encoding="utf-8-sig")))
-    assert {row["filter_reason"] for row in filtered} == {"low_likes", "already_complete"}
+    assert {row["filter_reason"] for row in filtered} == {"filtered_low_likes"}
+    skipped = list(csv.DictReader(open(outputs / "skipped_videos.csv", encoding="utf-8-sig")))
+    assert {row["skip_reason"] for row in skipped} == {"already_complete"}
+    eligible = list(csv.DictReader(open(outputs / "eligible_videos.csv", encoding="utf-8-sig")))
+    assert [row["aweme_id"] for row in eligible] == ["new", "incomplete"]
     assert (outputs / "search_result_all.csv").exists()
 
 

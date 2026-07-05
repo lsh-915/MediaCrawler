@@ -83,6 +83,12 @@ class SearchRequest(BaseModel):
     max_count: int = Field(20, description="每个关键词最大采集数", ge=1, le=200)
     min_likes_threshold: int = Field(500, description="min likes threshold", ge=0)
     force: bool = Field(False, description="ignore complete history index")
+    content_asset_comments_limit: int = Field(50, ge=1, le=5000)
+    content_asset_full_comments_limit: int = Field(200, ge=1, le=5000)
+    enable_region_title_filter: bool = Field(True)
+    enable_mandarin_filter: bool = Field(True)
+    skip_already_complete: bool = Field(True)
+    min_asr_text_length: int = Field(30, ge=0, le=1000)
     project_dir: Optional[str] = Field(None, description="工作目录（默认自动创建）")
 
     @field_validator("keywords")
@@ -128,6 +134,8 @@ class MergeRequest(BaseModel):
     comments_jsonl: Optional[str] = Field(None, description="评论 JSONL 路径")
     scripts_jsonl: Optional[str] = Field(None, description="文案 JSONL 路径")
     output_csv: Optional[str] = Field(None, description="输出 CSV 路径")
+    content_asset_comments_limit: int = Field(50, ge=1, le=5000)
+    content_asset_full_comments_limit: int = Field(200, ge=1, le=5000)
     project_dir: Optional[str] = Field(None, description="工作目录")
 
 
@@ -158,6 +166,12 @@ class RunAllRequest(BaseModel):
     max_count: int = Field(20, description="每个关键词最大采集数")
     min_likes_threshold: int = Field(500, description="min likes threshold", ge=0)
     force: bool = Field(False, description="ignore complete history index")
+    content_asset_comments_limit: int = Field(50, ge=1, le=5000)
+    content_asset_full_comments_limit: int = Field(200, ge=1, le=5000)
+    enable_region_title_filter: bool = Field(True)
+    enable_mandarin_filter: bool = Field(True)
+    skip_already_complete: bool = Field(True)
+    min_asr_text_length: int = Field(30, ge=0, le=1000)
     steps: Optional[List[str]] = Field(None, description="指定步骤（默认全部）")
     project_dir: Optional[str] = Field(None, description="工作目录")
 
@@ -228,6 +242,22 @@ def _make_scraper(project_dir: Optional[str], workspace: str) -> DouyinScraper:
     return DouyinScraper(config_dict)
 
 
+def _apply_collection_options(scraper: DouyinScraper, req: Any) -> None:
+    for attr in (
+        "min_likes_threshold",
+        "content_asset_comments_limit",
+        "content_asset_full_comments_limit",
+        "enable_region_title_filter",
+        "enable_mandarin_filter",
+        "skip_already_complete",
+        "min_asr_text_length",
+    ):
+        if hasattr(req, attr):
+            setattr(scraper.config, attr, getattr(req, attr))
+    if hasattr(req, "force"):
+        scraper.config.force_recollect_complete = bool(getattr(req, "force"))
+
+
 def _error_response(e: Exception) -> HTTPException:
     """将异常转换为 HTTP 响应"""
     if isinstance(e, ScraperError):
@@ -259,9 +289,14 @@ def _search_output_result(paths: Dict[str, Any], output: Path) -> Dict[str, Any]
         "video_jsonl": paths.get("video_jsonl", str(output)),
         "video_csv": paths.get("video_csv", ""),
         "csv_stats": paths.get("csv_stats", {}),
+        "eligible_videos_jsonl": paths.get("eligible_videos_jsonl", ""),
+        "eligible_videos_csv": paths.get("eligible_videos_csv", ""),
         "filtered_videos_jsonl": paths.get("filtered_videos_jsonl", ""),
         "filtered_videos_csv": paths.get("filtered_videos_csv", ""),
+        "skipped_videos_jsonl": paths.get("skipped_videos_jsonl", ""),
+        "skipped_videos_csv": paths.get("skipped_videos_csv", ""),
         "collection_filter_stats": paths.get("collection_filter_stats", {}),
+        "eligibility": (paths.get("collection_filter_stats", {}) or {}).get("eligibility", {}),
     }
 
 
@@ -760,8 +795,7 @@ async def search(req: SearchRequest) -> Dict[str, Any]:
     def _do_search() -> Dict[str, Any]:
         logger.info("API search request task_id=%s keywords=%r", task.task_id, req.keywords)
         scraper = _make_scraper(req.project_dir, task.workspace)
-        scraper.config.min_likes_threshold = req.min_likes_threshold
-        scraper.config.force_recollect_complete = req.force
+        _apply_collection_options(scraper, req)
         output = scraper.search(keywords=req.keywords, max_count=req.max_count)
         paths = scraper.get_paths()
         result = _search_output_result(paths, output)
@@ -923,6 +957,7 @@ async def merge(req: MergeRequest) -> Dict[str, Any]:
 
     def _do_merge() -> Dict[str, Any]:
         scraper = _make_scraper(req.project_dir, task.workspace)
+        _apply_collection_options(scraper, req)
         if req.search_task_id:
             search_task = tm.get_task(req.search_task_id)
             if not search_task or search_task.status != "completed":
@@ -1009,8 +1044,7 @@ async def run_all(req: RunAllRequest) -> Dict[str, Any]:
         scraper = _make_scraper(req.project_dir, task.workspace)
         scraper.config.keywords = req.keywords
         scraper.config.max_videos_per_keyword = req.max_count
-        scraper.config.min_likes_threshold = req.min_likes_threshold
-        scraper.config.force_recollect_complete = req.force
+        _apply_collection_options(scraper, req)
         result = scraper.run_all(steps=req.steps)
         if result.get("error"):
             error = str(result.get("error") or "run_all failed")

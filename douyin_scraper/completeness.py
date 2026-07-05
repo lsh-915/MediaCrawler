@@ -12,6 +12,8 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 REAL_SCRIPT_SOURCES = {"asr", "asr_raw", "subtitle", "caption", "ocr", "platform_caption"}
 FALLBACK_SCRIPT_SOURCES = {"source_clean_title", "source_title_desc", "source_desc", "title"}
+PLATFORM_TEXT_SCRIPT_SOURCES = {"source_clean_title", "source_title_desc", "source_desc"}
+PLATFORM_TEXT_SCRIPT_MIN_CHARS = 80
 COMMENTS_COMPLETE_STATUSES = {"success", "available", "no_more_comments"}
 COMMENTS_INCOMPLETE_STATUSES = {"failed", "partial", "error"}
 DATA_QUALITY_MESSAGES = {
@@ -22,6 +24,16 @@ DATA_QUALITY_MESSAGES = {
     "failed": "数据检查失败，请查看错误",
 }
 DEFAULT_MIN_LIKES_THRESHOLD = 500
+DEFAULT_REGION_TERMS = {
+    "北京", "上海", "广州", "深圳", "杭州", "南京", "成都", "重庆", "武汉", "西安",
+    "天津", "苏州", "郑州", "长沙", "青岛", "厦门", "佛山", "东莞", "合肥", "昆明",
+    "驾校", "考场", "车管所", "本地", "同城", "附近",
+}
+MANDARIN_LANGUAGE_VALUES = {"", "zh", "zh-cn", "zh_cn", "chinese", "cn", "mandarin"}
+DIALECT_HINTS = {
+    "粤语", "广东话", "白话", "港式", "闽南语", "台语", "四川话", "重庆话", "东北话",
+    "上海话", "吴语", "客家话", "河南话", "陕西话", "湖南话", "方言",
+}
 
 
 VIDEO_STATUS_FIELDNAMES = [
@@ -74,8 +86,25 @@ def _safe_int(value: Any) -> int:
         return 0
 
 
+def _optional_int(value: Any) -> Optional[int]:
+    if value in (None, ""):
+        return None
+    try:
+        return int(float(str(value).strip()))
+    except (TypeError, ValueError):
+        return None
+
+
 def _bool_status(value: str) -> bool:
     return value == "complete"
+
+
+def _is_complete_platform_text_script(source: str, text: str, asr_status: str) -> bool:
+    return (
+        asr_status == "no_audio"
+        and source in PLATFORM_TEXT_SCRIPT_SOURCES
+        and len(text) >= PLATFORM_TEXT_SCRIPT_MIN_CHARS
+    )
 
 
 def _read_csv(path: Path) -> List[Dict[str, Any]]:
@@ -150,6 +179,113 @@ def _identity(row: Dict[str, Any]) -> str:
         if value:
             return value
     return ""
+
+
+def _liked_count(row: Dict[str, Any]) -> Optional[int]:
+    for key in ("liked_count", "likes", "digg_count", "like_count"):
+        if key in row:
+            return _optional_int(row.get(key))
+    return None
+
+
+def _duration_value(row: Dict[str, Any]) -> Optional[int]:
+    for key in ("video_duration", "duration", "duration_ms", "video_duration_ms"):
+        if key in row:
+            return _optional_int(row.get(key))
+    return None
+
+
+def _is_truthy_text(value: Any) -> bool:
+    return _lower(value) in {"1", "true", "yes", "y", "on", "video"}
+
+
+def _load_region_terms(region_terms_path: Optional[Path] = None) -> List[str]:
+    candidates = []
+    if region_terms_path is not None:
+        candidates.append(Path(region_terms_path))
+    candidates.append(Path(__file__).parent / "filters" / "region_terms.txt")
+    for path in candidates:
+        if not path.exists():
+            continue
+        terms = [
+            line.strip()
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ]
+        if terms:
+            return terms
+    return sorted(DEFAULT_REGION_TERMS, key=len, reverse=True)
+
+
+def _region_title_matches(row: Dict[str, Any], terms: Sequence[str]) -> List[str]:
+    title = " ".join(
+        _text(row.get(key))
+        for key in ("clean_title", "title", "raw_title", "desc", "clean_desc")
+        if _text(row.get(key))
+    )
+    return [term for term in terms if term and term in title]
+
+
+def _filter_row(
+    row: Dict[str, Any],
+    *,
+    stage: str,
+    reason: str,
+    detail: str = "",
+    threshold: Any = "",
+) -> Dict[str, Any]:
+    return {
+        **row,
+        "filter_stage": stage,
+        "filter_reason": reason,
+        "filter_detail": detail,
+        "threshold": threshold,
+    }
+
+
+def _video_filter_reason(row: Dict[str, Any]) -> tuple[str, str]:
+    aweme_url = _lower(row.get("aweme_url") or row.get("video_url") or row.get("url"))
+    download_url = _lower(
+        row.get("video_download_url")
+        or row.get("download_url")
+        or row.get("video_url")
+        or row.get("play_addr")
+    )
+    item_type = _lower(row.get("aweme_type") or row.get("item_type") or row.get("type"))
+    is_video = row.get("is_video")
+
+    if "/note/" in aweme_url or item_type in {"note", "image", "images", "图文"}:
+        return "filtered_note_post", "note_or_image_post"
+    if is_video is not None and not _is_truthy_text(is_video):
+        return "filtered_not_video", "is_video=false"
+    if aweme_url and "/video/" not in aweme_url and "douyin.com" in aweme_url:
+        return "filtered_not_video", aweme_url
+    if not (download_url or aweme_url):
+        return "filtered_missing_video_url", "video url missing"
+    if ".mp3" in download_url or "music" in download_url:
+        return "filtered_audio_only", download_url
+    duration = _duration_value(row)
+    if duration is not None and duration <= 0:
+        return "filtered_zero_duration", str(duration)
+    return "", ""
+
+
+def _is_mandarin_script_row(row: Dict[str, Any], min_text_length: int) -> tuple[bool, str, str]:
+    language = _lower(row.get("language") or row.get("asr_language") or row.get("detected_language"))
+    if language not in MANDARIN_LANGUAGE_VALUES:
+        return False, "filtered_asr_language_not_zh", language
+    text = _text(
+        row.get("asr_raw_text")
+        or row.get("asr_text")
+        or row.get("script_raw_text")
+        or row.get("script_text")
+    )
+    if len(text) < min_text_length:
+        return False, "filtered_asr_too_short", f"length={len(text)}"
+    matched = [term for term in DIALECT_HINTS if term in text]
+    if matched:
+        return False, "filtered_non_mandarin", ",".join(sorted(matched))
+    return True, "", ""
 
 
 def _index_rows(rows: Iterable[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
@@ -237,6 +373,8 @@ def _script_raw_completeness(
         return "complete", [], asr_status
     if clean_source in {"subtitle", "caption", "platform_caption"} and clean_text:
         return "complete", [], asr_status
+    if _is_complete_platform_text_script(clean_source, clean_text, asr_status):
+        return "complete", [], asr_status
 
     for field in ("download_error", "asr_error"):
         value = _text(raw_row.get(field))
@@ -258,6 +396,8 @@ def _script_clean_completeness(clean_row: Dict[str, Any]) -> tuple[str, List[str
     notes = _lower(clean_row.get("script_clean_notes"))
 
     if text and source in REAL_SCRIPT_SOURCES:
+        return "complete", [], source
+    if _is_complete_platform_text_script(source, text, _lower(clean_row.get("asr_status"))):
         return "complete", [], source
     if source:
         reasons.append(source)
@@ -287,7 +427,15 @@ def _content_asset_completeness(
             reasons.append(f"content_asset_{field}_missing")
     if not script_text:
         reasons.append("content_asset_script_text_empty")
-    if source and source not in REAL_SCRIPT_SOURCES:
+    if (
+        source
+        and source not in REAL_SCRIPT_SOURCES
+        and not _is_complete_platform_text_script(
+            source,
+            script_text,
+            _lower(asset_row.get("asr_data_status")),
+        )
+    ):
         reasons.append(source)
     if _lower(asset_row.get("asr_data_status")) in {"missing", "dependency_missing", "download_failed", "failed"}:
         reasons.append(f"asr_data_status_{_lower(asset_row.get('asr_data_status'))}")
@@ -586,11 +734,22 @@ def filter_collectable_search_outputs(
     min_likes_threshold: int = DEFAULT_MIN_LIKES_THRESHOLD,
     index_path: Optional[Path] = None,
     force: bool = False,
+    enable_region_title_filter: bool = True,
+    skip_already_complete: bool = True,
+    region_terms_path: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """Filter search/script source outputs before comments/scripts/content_asset collection."""
     output = Path(output_dir)
     search_csv = output / "search_result.csv"
     search_jsonl = output / "search_result.jsonl"
+    empty_files = {
+        "filtered_videos_csv": str(output / "filtered_videos.csv"),
+        "filtered_videos_jsonl": str(output / "filtered_videos.jsonl"),
+        "eligible_videos_csv": str(output / "eligible_videos.csv"),
+        "eligible_videos_jsonl": str(output / "eligible_videos.jsonl"),
+        "skipped_videos_csv": str(output / "skipped_videos.csv"),
+        "skipped_videos_jsonl": str(output / "skipped_videos.jsonl"),
+    }
     if not search_csv.exists():
         return {
             "min_likes_threshold": min_likes_threshold,
@@ -600,13 +759,19 @@ def filter_collectable_search_outputs(
             "skipped_already_complete": 0,
             "new_videos_to_collect": 0,
             "incomplete_videos_to_repair": 0,
+            "eligible_videos": 0,
             "filter_applied": False,
+            "eligibility": {},
+            "files": empty_files,
         }
 
     search_rows = _read_csv(search_csv)
     search_json_rows = _read_jsonl(search_jsonl)
+    title_index = _index_rows(_read_csv(output / "search_title_clean.csv"))
     index = load_video_completeness_index(index_path or _default_index_path(output.parent))
+    region_terms = _load_region_terms(region_terms_path)
     filtered: List[Dict[str, Any]] = []
+    skipped: List[Dict[str, Any]] = []
     kept: List[Dict[str, Any]] = []
     skipped_complete = 0
     incomplete_history = 0
@@ -614,29 +779,55 @@ def filter_collectable_search_outputs(
 
     for row in search_rows:
         key = _text(row.get("aweme_id")) or _text(row.get("video_id"))
-        likes = _safe_int(row.get("liked_count") or row.get("likes"))
-        if min_likes_threshold > 0 and likes < min_likes_threshold:
-            filtered.append({
-                **row,
-                "filter_reason": "low_likes",
-                "threshold": min_likes_threshold,
-            })
+        video_reason, video_detail = _video_filter_reason(row)
+        if video_reason:
+            filtered.append(_filter_row(row, stage="video_type", reason=video_reason, detail=video_detail))
             continue
+        likes = _liked_count(row)
+        if min_likes_threshold > 0 and likes is None:
+            filtered.append(_filter_row(
+                row,
+                stage="likes",
+                reason="filtered_missing_likes",
+                threshold=min_likes_threshold,
+            ))
+            continue
+        if min_likes_threshold > 0 and likes is not None and likes < min_likes_threshold:
+            filtered.append(_filter_row(
+                row,
+                stage="likes",
+                reason="filtered_low_likes",
+                detail=f"liked_count={likes}",
+                threshold=min_likes_threshold,
+            ))
+            continue
+        if enable_region_title_filter:
+            title_row = _find_match(title_index, row) if title_index else {}
+            matched_terms = _region_title_matches({**row, **title_row}, region_terms)
+            if matched_terms:
+                filtered.append(_filter_row(
+                    row,
+                    stage="region_title",
+                    reason="filtered_region_title",
+                    detail=",".join(matched_terms),
+                ))
+                continue
         indexed = index.get(key) if key else None
-        if indexed and indexed.get("is_complete") and not force:
+        if indexed and indexed.get("is_complete") and skip_already_complete and not force:
             skipped_complete += 1
-            filtered.append({
+            skipped.append({
                 **row,
-                "filter_reason": "already_complete",
-                "threshold": min_likes_threshold,
+                "skip_stage": "history",
+                "skip_reason": "already_complete",
                 "latest_complete_task_id": indexed.get("latest_complete_task_id", ""),
+                "last_complete_at": indexed.get("last_complete_at", ""),
             })
             continue
         if indexed and not indexed.get("is_complete"):
             incomplete_history += 1
         else:
             new_count += 1
-        kept.append(row)
+        kept.append({**row, "eligibility_status": "eligible"})
 
     def _keep_json_row(row: Dict[str, Any]) -> bool:
         key = _text(row.get("aweme_id")) or _text(row.get("video_id"))
@@ -652,7 +843,8 @@ def filter_collectable_search_outputs(
     original_csv = output / "search_result_all.csv"
     if not original_csv.exists():
         search_csv.replace(original_csv)
-    _write_csv(search_csv, kept, search_rows[0].keys() if search_rows else [])
+    search_fieldnames = list(search_rows[0].keys() if search_rows else [])
+    _write_csv(search_csv, kept, search_fieldnames)
 
     script_sources_csv = output / "script_sources.csv"
     script_sources_jsonl = output / "script_sources.jsonl"
@@ -684,31 +876,69 @@ def filter_collectable_search_outputs(
 
     filtered_csv = output / "filtered_videos.csv"
     filtered_jsonl = output / "filtered_videos.jsonl"
+    skipped_csv = output / "skipped_videos.csv"
+    skipped_jsonl = output / "skipped_videos.jsonl"
+    eligible_csv = output / "eligible_videos.csv"
+    eligible_jsonl = output / "eligible_videos.jsonl"
+    eligible_fieldnames = list(dict.fromkeys(search_fieldnames + ["eligibility_status"]))
+    _write_csv(eligible_csv, kept, eligible_fieldnames)
+    _write_jsonl(eligible_jsonl, kept)
     if filtered:
         fieldnames = list(dict.fromkeys(
             list(search_rows[0].keys() if search_rows else [])
-            + ["filter_reason", "threshold", "latest_complete_task_id"]
+            + ["filter_stage", "filter_reason", "filter_detail", "threshold"]
         ))
         _write_csv(filtered_csv, filtered, fieldnames)
         _write_jsonl(filtered_jsonl, filtered)
     else:
-        _write_csv(filtered_csv, [], ["aweme_id", "video_id", "liked_count", "filter_reason", "threshold"])
+        _write_csv(filtered_csv, [], ["aweme_id", "video_id", "liked_count", "filter_stage", "filter_reason", "filter_detail", "threshold"])
         _write_jsonl(filtered_jsonl, [])
+    if skipped:
+        skipped_fields = list(dict.fromkeys(
+            search_fieldnames + ["skip_stage", "skip_reason", "latest_complete_task_id", "last_complete_at"]
+        ))
+        _write_csv(skipped_csv, skipped, skipped_fields)
+        _write_jsonl(skipped_jsonl, skipped)
+    else:
+        _write_csv(skipped_csv, [], ["aweme_id", "video_id", "skip_stage", "skip_reason", "latest_complete_task_id", "last_complete_at"])
+        _write_jsonl(skipped_jsonl, [])
+
+    reason_counts = Counter(_text(row.get("filter_reason")) for row in filtered)
+    eligibility = {
+        "videos_from_search": len(search_rows),
+        "eligible_videos": len(kept),
+        "filtered_total": len(filtered),
+        "skipped_already_complete": skipped_complete,
+        "filtered_not_video": reason_counts.get("filtered_not_video", 0),
+        "filtered_note_post": reason_counts.get("filtered_note_post", 0),
+        "filtered_missing_video_url": reason_counts.get("filtered_missing_video_url", 0),
+        "filtered_zero_duration": reason_counts.get("filtered_zero_duration", 0),
+        "filtered_audio_only": reason_counts.get("filtered_audio_only", 0),
+        "filtered_low_likes": reason_counts.get("filtered_low_likes", 0),
+        "filtered_missing_likes": reason_counts.get("filtered_missing_likes", 0),
+        "filtered_region_title": reason_counts.get("filtered_region_title", 0),
+    }
 
     stats = {
         "min_likes_threshold": min_likes_threshold,
         "videos_total_from_search": len(search_rows),
-        "videos_filtered_low_likes": sum(1 for row in filtered if row.get("filter_reason") == "low_likes"),
-        "videos_after_likes_filter": len(search_rows) - sum(1 for row in filtered if row.get("filter_reason") == "low_likes"),
+        "videos_filtered_low_likes": reason_counts.get("filtered_low_likes", 0),
+        "videos_after_likes_filter": len(search_rows) - reason_counts.get("filtered_low_likes", 0) - reason_counts.get("filtered_missing_likes", 0),
         "skipped_already_complete": skipped_complete,
         "new_videos_to_collect": new_count,
         "incomplete_videos_to_repair": incomplete_history,
         "videos_to_collect": len(kept),
         "filtered_total": len(filtered),
+        "eligible_videos": len(kept),
         "filter_applied": True,
+        "eligibility": eligibility,
         "files": {
             "filtered_videos_csv": str(filtered_csv),
             "filtered_videos_jsonl": str(filtered_jsonl),
+            "eligible_videos_csv": str(eligible_csv),
+            "eligible_videos_jsonl": str(eligible_jsonl),
+            "skipped_videos_csv": str(skipped_csv),
+            "skipped_videos_jsonl": str(skipped_jsonl),
             "search_result_all_csv": str(output / "search_result_all.csv"),
             "search_result_all_jsonl": str(output / "search_result_all.jsonl"),
         },
@@ -718,6 +948,126 @@ def filter_collectable_search_outputs(
         encoding="utf-8",
     )
     return stats
+
+
+def filter_script_raw_mandarin_outputs(
+    output_dir: Path,
+    *,
+    min_asr_text_length: int = 30,
+    enabled: bool = True,
+) -> Dict[str, Any]:
+    """Filter ASR/script_raw rows before script_clean/content_asset generation."""
+    output = Path(output_dir)
+    raw_csv = output / "script_raw.csv"
+    raw_jsonl = output / "script_raw.jsonl"
+    if not enabled or not raw_csv.exists():
+        return {
+            "enabled": enabled,
+            "script_raw_rows": 0,
+            "filtered_non_mandarin": 0,
+            "filtered_asr_too_short": 0,
+            "filtered_asr_language_not_zh": 0,
+            "eligible_script_raw_rows": 0,
+            "filter_applied": False,
+        }
+
+    raw_rows = _read_csv(raw_csv)
+    kept: List[Dict[str, Any]] = []
+    filtered: List[Dict[str, Any]] = []
+    kept_keys: set[str] = set()
+    for row in raw_rows:
+        ok, reason, detail = _is_mandarin_script_row(row, min_asr_text_length)
+        key = _text(row.get("aweme_id")) or _text(row.get("video_id"))
+        if ok:
+            kept.append(row)
+            if key:
+                kept_keys.add(key)
+        else:
+            filtered.append(_filter_row(row, stage="asr", reason=reason, detail=detail))
+
+    raw_fieldnames = list(raw_rows[0].keys() if raw_rows else [])
+    original_raw_csv = output / "script_raw_all.csv"
+    if not original_raw_csv.exists():
+        raw_csv.replace(original_raw_csv)
+    _write_csv(raw_csv, kept, raw_fieldnames)
+    raw_json_rows = _read_jsonl(raw_jsonl)
+    if raw_json_rows:
+        original_raw_jsonl = output / "script_raw_all.jsonl"
+        if not original_raw_jsonl.exists():
+            raw_jsonl.replace(original_raw_jsonl)
+        else:
+            raw_jsonl.unlink(missing_ok=True)
+        _write_jsonl(
+            raw_jsonl,
+            [
+                row for row in raw_json_rows
+                if (_text(row.get("aweme_id")) or _text(row.get("video_id"))) in kept_keys
+            ],
+        )
+
+    for stem in ("script_sources", "search_result", "eligible_videos"):
+        csv_path = output / f"{stem}.csv"
+        jsonl_path = output / f"{stem}.jsonl"
+        if csv_path.exists():
+            rows = _read_csv(csv_path)
+            original_csv = output / f"{stem}_before_asr_filter.csv"
+            if not original_csv.exists():
+                csv_path.replace(original_csv)
+            _write_csv(
+                csv_path,
+                [
+                    row for row in rows
+                    if (_text(row.get("aweme_id")) or _text(row.get("video_id"))) in kept_keys
+                ],
+                rows[0].keys() if rows else [],
+            )
+        if jsonl_path.exists():
+            rows = _read_jsonl(jsonl_path)
+            original_jsonl = output / f"{stem}_before_asr_filter.jsonl"
+            if not original_jsonl.exists():
+                jsonl_path.replace(original_jsonl)
+            else:
+                jsonl_path.unlink(missing_ok=True)
+            _write_jsonl(
+                jsonl_path,
+                [
+                    row for row in rows
+                    if (_text(row.get("aweme_id")) or _text(row.get("video_id"))) in kept_keys
+                ],
+            )
+
+    filtered_csv = output / "filtered_videos.csv"
+    filtered_jsonl = output / "filtered_videos.jsonl"
+    existing_filtered = _read_csv(filtered_csv) if filtered_csv.exists() else []
+    merged_filtered = existing_filtered + filtered
+    filtered_fields = list(dict.fromkeys(
+        [key for row in merged_filtered for key in row.keys()]
+        or ["aweme_id", "video_id", "filter_stage", "filter_reason", "filter_detail", "threshold"]
+    ))
+    _write_csv(filtered_csv, merged_filtered, filtered_fields)
+    _write_jsonl(filtered_jsonl, merged_filtered)
+
+    stats_path = output / "collection_filter_stats.json"
+    stats = _read_json(stats_path)
+    reason_counts = Counter(_text(row.get("filter_reason")) for row in filtered)
+    eligibility = dict(stats.get("eligibility") or {})
+    eligibility["eligible_videos"] = len(kept)
+    eligibility["filtered_total"] = _safe_int(eligibility.get("filtered_total")) + len(filtered)
+    for reason in ("filtered_non_mandarin", "filtered_asr_too_short", "filtered_asr_language_not_zh"):
+        eligibility[reason] = _safe_int(eligibility.get(reason)) + reason_counts.get(reason, 0)
+    stats["eligibility"] = eligibility
+    stats["eligible_videos"] = len(kept)
+    stats["filtered_total"] = _safe_int(stats.get("filtered_total")) + len(filtered)
+    stats["asr_mandarin_filter"] = {
+        "enabled": True,
+        "script_raw_rows": len(raw_rows),
+        "eligible_script_raw_rows": len(kept),
+        "filtered_non_mandarin": reason_counts.get("filtered_non_mandarin", 0),
+        "filtered_asr_too_short": reason_counts.get("filtered_asr_too_short", 0),
+        "filtered_asr_language_not_zh": reason_counts.get("filtered_asr_language_not_zh", 0),
+    }
+    stats_path.write_text(json.dumps(stats, ensure_ascii=False, indent=2), encoding="utf-8")
+    return stats["asr_mandarin_filter"]
 
 
 def load_video_completeness(task_workspace: Path) -> List[Dict[str, Any]]:

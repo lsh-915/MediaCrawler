@@ -160,6 +160,131 @@ def test_completeness_marks_title_fallback_scripts_incomplete(tmp_path: Path) ->
     assert (outputs / "completeness_video_status.csv").exists()
 
 
+def test_completeness_accepts_no_audio_platform_text_only(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspaces" / "note00000000"
+    outputs = workspace / "outputs"
+    long_note_text = (
+        "靠边停车是科目三的关键一步，掌握好这组要点才能顺利通过！"
+        "看到指令后先打右转向灯，观察后视镜，确认安全后平稳向右变道，"
+        "逐步接近边线，车身距边线约30厘米左右最佳。"
+    )
+    search_rows = [
+        {
+            "source_keyword": "parking",
+            "platform": "douyin",
+            "video_id": "note-1",
+            "aweme_id": "note-1",
+            "aweme_url": "https://www.douyin.com/note/note-1",
+            "title": long_note_text,
+            "desc": long_note_text,
+            "liked_count": "1",
+            "collected_count": "1",
+            "comment_count": "1",
+            "share_count": "1",
+        },
+        {
+            "source_keyword": "parking",
+            "platform": "douyin",
+            "video_id": "deleted-1",
+            "aweme_id": "deleted-1",
+            "aweme_url": "https://www.douyin.com/video/deleted-1",
+            "title": "deleted title",
+            "desc": "deleted title",
+            "liked_count": "1",
+            "collected_count": "1",
+            "comment_count": "1",
+            "share_count": "1",
+        },
+    ]
+    _write_csv(outputs / "search_result.csv", list(search_rows[0]), search_rows)
+    _write_csv(
+        outputs / "comments_video_status.csv",
+        ["aweme_id", "status", "comments_collected", "target_comments"],
+        [
+            {
+                "aweme_id": row["aweme_id"],
+                "status": "success",
+                "comments_collected": "200",
+                "target_comments": "200",
+            }
+            for row in search_rows
+        ],
+    )
+    _write_csv(
+        outputs / "script_raw.csv",
+        ["video_id", "aweme_id", "asr_status", "asr_raw_text", "asr_engine", "download_error"],
+        [
+            {
+                "video_id": "note-1",
+                "aweme_id": "note-1",
+                "asr_status": "no_audio",
+                "asr_raw_text": "",
+                "asr_engine": "faster_whisper",
+                "download_error": "",
+            },
+            {
+                "video_id": "deleted-1",
+                "aweme_id": "deleted-1",
+                "asr_status": "download_failed",
+                "asr_raw_text": "",
+                "asr_engine": "faster_whisper",
+                "download_error": "HTTP 404",
+            },
+        ],
+    )
+    _write_csv(
+        outputs / "script_clean.csv",
+        ["video_id", "aweme_id", "script_clean_text", "script_clean_source", "script_clean_notes", "asr_status"],
+        [
+            {
+                "video_id": "note-1",
+                "aweme_id": "note-1",
+                "script_clean_text": long_note_text,
+                "script_clean_source": "source_clean_title",
+                "script_clean_notes": "fallback_source_clean_title|asr_status_no_audio",
+                "asr_status": "no_audio",
+            },
+            {
+                "video_id": "deleted-1",
+                "aweme_id": "deleted-1",
+                "script_clean_text": "deleted title",
+                "script_clean_source": "source_clean_title",
+                "script_clean_notes": "fallback_source_clean_title|asr_status_download_failed",
+                "asr_status": "download_failed",
+            },
+        ],
+    )
+    asset_rows = [
+        {
+            **search_rows[0],
+            "script_clean_text": long_note_text,
+            "script_clean_source": "source_clean_title",
+            "comment_data_status": "available",
+            "asr_data_status": "no_audio",
+        },
+        {
+            **search_rows[1],
+            "script_clean_text": "deleted title",
+            "script_clean_source": "source_clean_title",
+            "comment_data_status": "available",
+            "asr_data_status": "download_failed",
+        },
+    ]
+    (outputs / "content_asset.jsonl").write_text(
+        "".join(__import__("json").dumps(row, ensure_ascii=False) + "\n" for row in asset_rows),
+        encoding="utf-8",
+    )
+
+    report = write_task_completeness_report(workspace, task_id="note00000000")
+
+    assert report["videos_total"] == 2
+    assert report["dimensions"]["scripts"] == {"complete": 1, "incomplete": 1}
+    assert report["dimensions"]["content_asset"] == {"complete": 1, "incomplete": 1}
+    assert report["incomplete_reasons"]["download_failed"] == 1
+    assert report["incomplete_reasons"]["source_clean_title"] == 1
+    assert select_incomplete_videos(report, ["scripts"]) == ["deleted-1"]
+
+
 def test_completeness_marks_partial_comments_incomplete(tmp_path: Path) -> None:
     workspace = tmp_path / "workspaces" / "bbbbbbbbbbbb"
     outputs = workspace / "outputs"
