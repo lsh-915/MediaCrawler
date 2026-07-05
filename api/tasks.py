@@ -273,6 +273,7 @@ class TaskManager:
                 break
             _time.sleep(0.5)
 
+        interrupted: List[TaskInfo] = []
         with self._lock:
             killed = 0
             finished = 0
@@ -282,9 +283,17 @@ class TaskManager:
                     task.completed_at = _now_iso()
                     task.error = "任务被中断：服务正在关闭（容器重启/进程退出）"
                     task.exit_code = 4
+                    interrupted.append(task)
                     killed += 1
                 elif task.status == "completed":
                     finished += 1
+
+        for task in interrupted:
+            recovery_result = self._attach_data_quality(task, task.result or {})
+            if recovery_result:
+                task.result = recovery_result
+
+        with self._lock:
             if killed > 0:
                 self._save_registry()
             if killed > 0 or finished > 0:
@@ -596,14 +605,18 @@ class TaskManager:
                     logger.info("任务完成: %s", task.task_id)
                     self._broadcast("task_completed", task)
                 except Exception as e:
+                    from douyin_scraper.utils import classify_error
+
                     with self._lock:
                         task.status = "failed"
                         task.completed_at = _now_iso()
                         task.error = str(e)[:500]
-
-                        # 分类退出码
-                        from douyin_scraper.utils import classify_error
                         task.exit_code = classify_error(e)
+
+                    recovery_result = self._attach_data_quality(task, {})
+                    with self._lock:
+                        if recovery_result:
+                            task.result = recovery_result
                         self._save_registry()
                     logger.error(
                         "任务失败: %s (exit_code=%d): %s",
@@ -727,8 +740,8 @@ class TaskManager:
     @staticmethod
     def _run_all_result_names() -> tuple[str, ...]:
         return (
-            "content_asset_full.csv",
             "content_asset.csv",
+            "content_asset_full.csv",
             "content_asset.jsonl",
             "douyin_koubo_data.csv",
             "search_result.csv",
@@ -760,8 +773,8 @@ class TaskManager:
     @staticmethod
     def _merge_result_names() -> tuple[str, ...]:
         return (
-            "content_asset_full.csv",
             "content_asset.csv",
+            "content_asset_full.csv",
             "content_asset.jsonl",
             "douyin_koubo_data.csv",
         )
@@ -769,8 +782,8 @@ class TaskManager:
     @staticmethod
     def _resume_result_names() -> tuple[str, ...]:
         return (
-            "content_asset_full.csv",
             "content_asset.csv",
+            "content_asset_full.csv",
             "content_asset.jsonl",
             "completeness_report.json",
         )
