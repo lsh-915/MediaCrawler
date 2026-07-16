@@ -234,6 +234,45 @@ def test_script_raw_default_limit_follows_max_videos_per_keyword(
     assert by_id["raw-3"]["download_error"] == "max_script_raw_items_limit"
 
 
+def test_extract_script_raw_keeps_default_zh_asr_after_mandarin_filter(
+    tmp_path: Path,
+) -> None:
+    scraper = _scraper(tmp_path)
+    outputs = tmp_path / "workspaces" / "scripts-task" / "outputs"
+    sources = outputs / "script_sources.jsonl"
+    _write_jsonl(
+        sources,
+        [_source("raw-zh", video_url="https://example.com/raw-zh.mp4")],
+    )
+    transcript = (
+        "普通话讲解科目三起步观察打灯换挡保持车速稳定通过路口减速"
+        "靠边停车保持车距"
+    )
+
+    with (
+        patch("douyin_scraper.core.check_disk_space_enforced"),
+        patch.object(
+            scraper,
+            "_load_script_raw_whisper_model",
+            return_value=(object(), "", ""),
+        ),
+        patch.object(scraper, "_download_video", return_value=True),
+        patch.object(scraper, "_transcribe_video", return_value=transcript),
+    ):
+        scraper.extract_script_raw(script_sources_jsonl=sources, max_items=1)
+
+    with open(outputs / "script_raw.csv", "r", encoding="utf-8-sig", newline="") as handle:
+        raw_rows = list(csv.DictReader(handle))
+    with open(outputs / "script_clean.csv", "r", encoding="utf-8-sig", newline="") as handle:
+        clean_rows = list(csv.DictReader(handle))
+
+    assert [row["aweme_id"] for row in raw_rows] == ["raw-zh"]
+    assert raw_rows[0]["asr_language"] == "zh"
+    assert raw_rows[0]["asr_raw_text"] == transcript
+    assert clean_rows[0]["script_clean_source"] == "asr_raw"
+    assert clean_rows[0]["script_clean_text"] == transcript
+
+
 def test_script_raw_fallback_to_csv_download_failed_and_empty_asr(
     tmp_path: Path,
 ) -> None:

@@ -2338,6 +2338,7 @@ class DouyinScraper:
             "download_status",
             "download_error",
             "asr_status",
+            "asr_language",
             "asr_raw_text",
             "asr_error",
             "script_raw_quality",
@@ -2494,6 +2495,7 @@ class DouyinScraper:
                     "download_status": "skipped",
                     "download_error": "",
                     "asr_status": "skipped",
+                    "asr_language": "",
                     "asr_raw_text": "",
                     "asr_error": "",
                     "script_raw_quality": "missing",
@@ -2541,6 +2543,7 @@ class DouyinScraper:
                     continue
 
                 row["download_status"] = "success"
+                row["asr_language"] = "zh"
                 stats["download_success"] += 1
 
                 try:
