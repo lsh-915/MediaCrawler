@@ -39,6 +39,45 @@ def test_search_selector_prefers_standard_csv(
     assert result.name == "search_result.csv"
 
 
+def test_run_all_selector_prefers_standard_content_asset(tmp_path: Path) -> None:
+    result = _selected_result(
+        tmp_path,
+        "run_all",
+        (
+            "search_result.csv",
+            "content_asset.jsonl",
+            "content_asset.csv",
+            "content_asset_full.csv",
+        ),
+    )
+    assert result is not None
+    assert result.name == "content_asset.csv"
+
+
+def test_run_all_selector_falls_back_to_standard_content_asset(
+    tmp_path: Path,
+) -> None:
+    result = _selected_result(
+        tmp_path,
+        "run_all",
+        ("search_result.csv", "content_asset.jsonl", "content_asset.csv"),
+    )
+    assert result is not None
+    assert result.name == "content_asset.csv"
+
+
+def test_run_all_selector_falls_back_to_full_content_asset(
+    tmp_path: Path,
+) -> None:
+    result = _selected_result(
+        tmp_path,
+        "run_all",
+        ("search_result.csv", "content_asset.jsonl", "content_asset_full.csv"),
+    )
+    assert result is not None
+    assert result.name == "content_asset_full.csv"
+
+
 def test_comments_selector_prefers_clean_output(tmp_path: Path) -> None:
     result = _selected_result(
         tmp_path,
@@ -72,6 +111,19 @@ def test_fallback_selector_uses_newest_supported_file(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("files", "expected"),
     [
+        (
+            (
+                "douyin_koubo_data.csv",
+                "content_asset.jsonl",
+                "content_asset.csv",
+                "content_asset_full.csv",
+            ),
+            "content_asset.csv",
+        ),
+        (
+            ("douyin_koubo_data.csv", "content_asset.jsonl", "content_asset_full.csv"),
+            "content_asset_full.csv",
+        ),
         (
             ("douyin_koubo_data.csv", "content_asset.jsonl", "content_asset.csv"),
             "content_asset.csv",

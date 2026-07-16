@@ -21,6 +21,11 @@ def _read_jsonl(path: Path) -> list[dict]:
     ]
 
 
+def _read_csv(path: Path) -> list[dict]:
+    with open(path, "r", encoding="utf-8-sig", newline="") as f:
+        return [dict(row) for row in csv.DictReader(f)]
+
+
 def test_content_asset_from_search_and_title_only(tmp_path: Path) -> None:
     search_outputs = tmp_path / "workspaces" / "search-task" / "outputs"
     _write_csv(
@@ -97,7 +102,29 @@ def test_content_asset_from_search_and_title_only(tmp_path: Path) -> None:
     assert stats["rows_in"] == 1
     assert stats["rows_out"] == 1
     assert stats["content_asset_csv_generated"] is True
+    assert stats["content_asset_full_csv_generated"] is True
     assert csv_path.read_bytes()[:3] == b"\xef\xbb\xbf"
+    full_csv_path = csv_path.with_name("content_asset_full.csv")
+    assert full_csv_path.read_bytes()[:3] == b"\xef\xbb\xbf"
+    full_csv_rows = _read_csv(full_csv_path)
+    assert len(full_csv_rows) == 1
+    assert full_csv_rows[0]["video_id"] == "a1"
+    assert full_csv_rows[0]["clean_title"] == "\u4e2d\u6587"
+    csv_rows = _read_csv(csv_path)
+    with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
+        headers = csv.DictReader(f).fieldnames
+    assert headers == [
+        "video_id",
+        "platform",
+        "script_text",
+        "likes",
+        "favorites",
+        "shares",
+        "comments",
+    ]
+    assert csv_rows == []
+    assert stats["standard_rows_out"] == 0
+    assert stats["standard_rows_skipped"] == 1
     json_text = jsonl_path.read_text(encoding="utf-8")
     assert "\u4e2d\u6587" in json_text
     assert "\\u4e2d\\u6587" not in json_text
@@ -111,6 +138,106 @@ def test_content_asset_from_search_and_title_only(tmp_path: Path) -> None:
     assert paths["content_asset_jsonl"] == str(jsonl_path)
     assert paths["content_asset_csv"] == str(csv_path)
     assert paths["content_asset_stats"]["rows_out"] == 1
+
+
+def test_content_asset_exports_up_to_50_comments_per_video(tmp_path: Path) -> None:
+    search_outputs = tmp_path / "workspaces" / "search-task" / "outputs"
+    comments_outputs = tmp_path / "workspaces" / "comments-task" / "outputs"
+    scripts_outputs = tmp_path / "workspaces" / "scripts-task" / "outputs"
+    _write_csv(
+        search_outputs / "search_result.csv",
+        [
+            "source_keyword",
+            "platform",
+            "video_id",
+            "aweme_id",
+            "title",
+            "desc",
+            "liked_count",
+            "collected_count",
+            "comment_count",
+            "share_count",
+            "aweme_url",
+        ],
+        [{
+            "source_keyword": "parking",
+            "platform": "douyin",
+            "video_id": "video-1",
+            "aweme_id": "a1",
+            "title": "raw title",
+            "desc": "raw desc",
+            "liked_count": "1",
+            "collected_count": "2",
+            "comment_count": "55",
+            "share_count": "3",
+            "aweme_url": "https://www.douyin.com/video/a1",
+        }],
+    )
+    _write_csv(
+        comments_outputs / "comments_clean.csv",
+        [
+            "video_id",
+            "aweme_id",
+            "comment_id",
+            "clean_content",
+            "is_valid",
+            "invalid_reason",
+            "pain_tags",
+        ],
+        [
+            {
+                "video_id": "video-1",
+                "aweme_id": "a1",
+                "comment_id": f"c{i:02d}",
+                "clean_content": f"valid comment {i:02d}",
+                "is_valid": "true",
+                "invalid_reason": "",
+                "pain_tags": "line",
+            }
+            for i in range(1, 56)
+        ],
+    )
+    _write_csv(
+        scripts_outputs / "script_clean.csv",
+        [
+            "video_id",
+            "aweme_id",
+            "aweme_url",
+            "script_clean_text",
+            "script_clean_source",
+            "script_clean_quality",
+        ],
+        [{
+            "video_id": "video-1",
+            "aweme_id": "a1",
+            "aweme_url": "https://www.douyin.com/video/a1",
+            "script_clean_text": "clean script text long enough",
+            "script_clean_source": "asr",
+            "script_clean_quality": "high",
+        }],
+    )
+
+    scraper = DouyinScraper({
+        "project_dir": str(tmp_path),
+        "state_dir_name": "workspaces/merge-task/state",
+    })
+    jsonl_path, csv_path, stats = scraper.build_content_asset(
+        search_outputs,
+        comments_outputs,
+        scripts_outputs,
+    )
+
+    row = _read_jsonl(jsonl_path)[0]
+    json_comments = row["top_valid_comments"].split("|")
+    csv_comments = _read_csv(csv_path)[0]["comments"].split("|")
+    assert row["valid_comment_count"] == 55
+    assert len(json_comments) == 55
+    assert len(csv_comments) == 50
+    assert json_comments[0] == "valid comment 01"
+    assert json_comments[-1] == "valid comment 55"
+    assert stats["content_asset_comments_limit"] == 50
+    assert stats["content_asset_full_comments_limit"] == 200
+    assert stats["standard_rows_out"] == 1
 
 
 def test_content_asset_aggregates_comments_and_scripts(tmp_path: Path) -> None:

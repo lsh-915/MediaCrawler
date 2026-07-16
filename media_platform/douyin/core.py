@@ -129,14 +129,18 @@ class DouYinCrawler(AbstractCrawler):
         dy_limit_count = 10  # douyin limit page fixed value
         if config.CRAWLER_MAX_NOTES_COUNT < dy_limit_count:
             config.CRAWLER_MAX_NOTES_COUNT = dy_limit_count
+        target_count = config.CRAWLER_MAX_NOTES_COUNT
+        requested_pages = max(1, (target_count + dy_limit_count - 1) // dy_limit_count)
         start_page = config.START_PAGE  # start page number
         for keyword in config.KEYWORDS.split(","):
             source_keyword_var.set(keyword)
             utils.logger.info(f"[DouYinCrawler.search] Current keyword: {keyword}")
             aweme_list: List[str] = []
+            seen_aweme_ids = set()
             page = 0
             dy_search_id = ""
-            while (page - start_page + 1) * dy_limit_count <= config.CRAWLER_MAX_NOTES_COUNT:
+            max_search_page = start_page + requested_pages * 3 - 1
+            while len(aweme_list) < target_count and page <= max_search_page:
                 if page < start_page:
                     utils.logger.info(f"[DouYinCrawler.search] Skip {page}")
                     page += 1
@@ -167,10 +171,16 @@ class DouYinCrawler(AbstractCrawler):
                         aweme_info: Dict = (post_item.get("aweme_info") or post_item.get("aweme_mix_info", {}).get("mix_items")[0])
                     except TypeError:
                         continue
-                    aweme_list.append(aweme_info.get("aweme_id", ""))
-                    page_aweme_list.append(aweme_info.get("aweme_id", ""))
+                    aweme_id = aweme_info.get("aweme_id", "")
+                    if not aweme_id or aweme_id in seen_aweme_ids:
+                        continue
+                    seen_aweme_ids.add(aweme_id)
+                    aweme_list.append(aweme_id)
+                    page_aweme_list.append(aweme_id)
                     await douyin_store.update_douyin_aweme(aweme_item=aweme_info)
                     await self.get_aweme_media(aweme_item=aweme_info)
+                    if len(aweme_list) >= target_count:
+                        break
                 
                 # Batch get note comments for the current page
                 await self.batch_get_note_comments(page_aweme_list)
@@ -178,6 +188,11 @@ class DouYinCrawler(AbstractCrawler):
                 # Sleep after each page navigation
                 await asyncio.sleep(config.CRAWLER_MAX_SLEEP_SEC)
                 utils.logger.info(f"[DouYinCrawler.search] Sleeping for {config.CRAWLER_MAX_SLEEP_SEC} seconds after page {page-1}")
+            if len(aweme_list) < target_count and page > max_search_page:
+                utils.logger.info(
+                    f"[DouYinCrawler.search] keyword:{keyword} reached search page cap "
+                    f"unique={len(aweme_list)} target={target_count} max_page={max_search_page}"
+                )
             utils.logger.info(f"[DouYinCrawler.search] keyword:{keyword}, aweme_list:{aweme_list}")
 
     async def get_specified_awemes(self):

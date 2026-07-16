@@ -57,9 +57,24 @@ def _now_iso() -> str:
 
 def _safe_log(level: str, msg: str, *args: Any) -> None:
     """Best-effort logging for shutdown/atexit paths after pytest closes streams."""
-    stream = getattr(sys, "stdout", None)
-    if stream is None or getattr(stream, "closed", False):
+    stdout = getattr(sys, "stdout", None)
+    stderr = getattr(sys, "stderr", None)
+    if (
+        stdout is None
+        or stderr is None
+        or getattr(stdout, "closed", False)
+        or getattr(stderr, "closed", False)
+    ):
         return
+    current: Optional[logging.Logger] = logger
+    while current is not None:
+        for handler in current.handlers:
+            handler_stream = getattr(handler, "stream", None)
+            if handler_stream is not None and getattr(handler_stream, "closed", False):
+                return
+        if not current.propagate:
+            break
+        current = current.parent
     try:
         getattr(logger, level)(msg, *args)
     except (ValueError, OSError, AttributeError):
@@ -124,6 +139,10 @@ class TaskInfo:
         self.exit_code: int = 0
         self.result: Optional[Dict[str, Any]] = None
         self.progress: str = ""
+        self.data_quality_status: Optional[str] = None
+        self.data_quality_message: Optional[str] = None
+        self.repair_available: bool = False
+        self.recommended_repair_dimensions: List[str] = []
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -139,6 +158,10 @@ class TaskInfo:
             "exit_code": self.exit_code,
             "result": self.result,
             "progress": self.progress,
+            "data_quality_status": self.data_quality_status,
+            "data_quality_message": self.data_quality_message,
+            "repair_available": self.repair_available,
+            "recommended_repair_dimensions": self.recommended_repair_dimensions,
         }
 
     @classmethod
@@ -157,6 +180,10 @@ class TaskInfo:
         task.exit_code = data.get("exit_code", 0)
         task.result = data.get("result")
         task.progress = data.get("progress", "")
+        task.data_quality_status = data.get("data_quality_status")
+        task.data_quality_message = data.get("data_quality_message")
+        task.repair_available = bool(data.get("repair_available", False))
+        task.recommended_repair_dimensions = list(data.get("recommended_repair_dimensions") or [])
         return task
 
 
@@ -246,6 +273,7 @@ class TaskManager:
                 break
             _time.sleep(0.5)
 
+        interrupted: List[TaskInfo] = []
         with self._lock:
             killed = 0
             finished = 0
@@ -255,9 +283,17 @@ class TaskManager:
                     task.completed_at = _now_iso()
                     task.error = "任务被中断：服务正在关闭（容器重启/进程退出）"
                     task.exit_code = 4
+                    interrupted.append(task)
                     killed += 1
                 elif task.status == "completed":
                     finished += 1
+
+        for task in interrupted:
+            recovery_result = self._attach_data_quality(task, task.result or {})
+            if recovery_result:
+                task.result = recovery_result
+
+        with self._lock:
             if killed > 0:
                 self._save_registry()
             if killed > 0 or finished > 0:
@@ -307,6 +343,94 @@ class TaskManager:
             close_log_handlers_under(workspace_path)
         except OSError:
             pass
+
+    def _attach_data_quality(self, task: TaskInfo, result: Dict[str, Any]) -> Dict[str, Any]:
+        """Best-effort completeness report/index update after a task finishes."""
+        output_dir = Path(task.workspace) / "outputs"
+        if not output_dir.exists():
+            return result
+        has_quality_input = any(
+            (output_dir / name).exists()
+            for name in (
+                "search_result.csv",
+                "content_asset.csv",
+                "content_asset_full.csv",
+                "content_asset.jsonl",
+            )
+        )
+        if not has_quality_input:
+            return result
+
+        try:
+            from douyin_scraper.completeness import (
+                update_video_completeness_index,
+                write_task_completeness_report,
+            )
+
+            report = write_task_completeness_report(Path(task.workspace), task_id=task.task_id)
+            index_path = update_video_completeness_index(
+                Path(task.workspace),
+                task_id=task.task_id,
+                report=report,
+            )
+            task.data_quality_status = str(report.get("data_quality_status") or "")
+            task.data_quality_message = str(report.get("data_quality_message") or report.get("message") or "")
+            task.repair_available = bool(report.get("repair_available"))
+            task.recommended_repair_dimensions = list(report.get("recommended_repair_dimensions") or [])
+            result.update({
+                "data_quality_status": task.data_quality_status,
+                "data_quality_message": task.data_quality_message,
+                "repair_available": task.repair_available,
+                "recommended_repair_dimensions": task.recommended_repair_dimensions,
+                "completeness_report": report.get("files", {}).get("completeness_report", ""),
+                "video_completeness_index": str(index_path),
+                "completeness": {
+                    "videos_total": report.get("videos_total", 0),
+                    "videos_complete": report.get("videos_complete", 0),
+                    "videos_incomplete": report.get("videos_incomplete", 0),
+                    "dimensions": report.get("dimensions", {}),
+                    "incomplete_reasons": report.get("incomplete_reasons", {}),
+                },
+            })
+        except Exception as exc:
+            task.data_quality_status = "failed"
+            task.data_quality_message = f"数据检查失败，请查看错误: {str(exc)[:200]}"
+            task.repair_available = False
+            task.recommended_repair_dimensions = []
+            result.update({
+                "data_quality_status": task.data_quality_status,
+                "data_quality_message": task.data_quality_message,
+                "repair_available": False,
+                "recommended_repair_dimensions": [],
+            })
+            logger.warning("data quality check failed for task %s: %s", task.task_id, exc)
+        return result
+
+    def update_task_data_quality(self, task_id: str, report: Dict[str, Any]) -> None:
+        """Persist data quality fields from a freshly built completeness report."""
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task is None:
+                return
+            task.data_quality_status = str(report.get("data_quality_status") or "")
+            task.data_quality_message = str(report.get("data_quality_message") or report.get("message") or "")
+            task.repair_available = bool(report.get("repair_available"))
+            task.recommended_repair_dimensions = list(report.get("recommended_repair_dimensions") or [])
+            if task.result is not None:
+                task.result.update({
+                    "data_quality_status": task.data_quality_status,
+                    "data_quality_message": task.data_quality_message,
+                    "repair_available": task.repair_available,
+                    "recommended_repair_dimensions": task.recommended_repair_dimensions,
+                    "completeness": {
+                        "videos_total": report.get("videos_total", 0),
+                        "videos_complete": report.get("videos_complete", 0),
+                        "videos_incomplete": report.get("videos_incomplete", 0),
+                        "dimensions": report.get("dimensions", {}),
+                        "incomplete_reasons": report.get("incomplete_reasons", {}),
+                    },
+                })
+            self._save_registry()
 
     def _register_shutdown_handlers(self) -> None:
         """
@@ -471,22 +595,28 @@ class TaskManager:
 
                 try:
                     result = func(*args, **kwargs)
+                    result_dict = result if isinstance(result, dict) else {"output": str(result)}
+                    result_dict = self._attach_data_quality(task, result_dict)
                     with self._lock:
                         task.status = "completed"
                         task.completed_at = _now_iso()
-                        task.result = result if isinstance(result, dict) else {"output": str(result)}
+                        task.result = result_dict
                         self._save_registry()
                     logger.info("任务完成: %s", task.task_id)
                     self._broadcast("task_completed", task)
                 except Exception as e:
+                    from douyin_scraper.utils import classify_error
+
                     with self._lock:
                         task.status = "failed"
                         task.completed_at = _now_iso()
                         task.error = str(e)[:500]
-
-                        # 分类退出码
-                        from douyin_scraper.utils import classify_error
                         task.exit_code = classify_error(e)
+
+                    recovery_result = self._attach_data_quality(task, {})
+                    with self._lock:
+                        if recovery_result:
+                            task.result = recovery_result
                         self._save_registry()
                     logger.error(
                         "任务失败: %s (exit_code=%d): %s",
@@ -609,7 +739,14 @@ class TaskManager:
 
     @staticmethod
     def _run_all_result_names() -> tuple[str, ...]:
-        return ("search_result.csv", "search_result.jsonl")
+        return (
+            "content_asset.csv",
+            "content_asset_full.csv",
+            "content_asset.jsonl",
+            "douyin_koubo_data.csv",
+            "search_result.csv",
+            "search_result.jsonl",
+        )
 
 
     @staticmethod
@@ -637,8 +774,18 @@ class TaskManager:
     def _merge_result_names() -> tuple[str, ...]:
         return (
             "content_asset.csv",
+            "content_asset_full.csv",
             "content_asset.jsonl",
             "douyin_koubo_data.csv",
+        )
+
+    @staticmethod
+    def _resume_result_names() -> tuple[str, ...]:
+        return (
+            "content_asset.csv",
+            "content_asset_full.csv",
+            "content_asset.jsonl",
+            "completeness_report.json",
         )
 
     @classmethod

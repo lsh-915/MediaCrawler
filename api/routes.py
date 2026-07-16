@@ -16,6 +16,8 @@ API 设计决策：
   - 结果文件路径硬编码 → 部署后找不到文件
 """
 
+import csv
+import json
 import logging
 import os
 import shutil
@@ -29,6 +31,11 @@ from pydantic import BaseModel, Field, field_validator
 from typing import Literal
 
 from douyin_scraper import DouyinScraper, ScraperConfig
+from douyin_scraper.completeness import (
+    select_incomplete_videos,
+    update_video_completeness_index,
+    write_task_completeness_report,
+)
 from douyin_scraper.exceptions import (
     ConfigError,
     FatalError,
@@ -74,6 +81,14 @@ class SearchRequest(BaseModel):
     """搜索采集请求"""
     keywords: List[str] = Field(..., description="搜索关键词列表")
     max_count: int = Field(20, description="每个关键词最大采集数", ge=1, le=200)
+    min_likes_threshold: int = Field(500, description="min likes threshold", ge=0)
+    force: bool = Field(False, description="ignore complete history index")
+    content_asset_comments_limit: int = Field(50, ge=1, le=5000)
+    content_asset_full_comments_limit: int = Field(200, ge=1, le=5000)
+    enable_region_title_filter: bool = Field(True)
+    enable_mandarin_filter: bool = Field(True)
+    skip_already_complete: bool = Field(True)
+    min_asr_text_length: int = Field(30, ge=0, le=1000)
     project_dir: Optional[str] = Field(None, description="工作目录（默认自动创建）")
 
     @field_validator("keywords")
@@ -119,6 +134,8 @@ class MergeRequest(BaseModel):
     comments_jsonl: Optional[str] = Field(None, description="评论 JSONL 路径")
     scripts_jsonl: Optional[str] = Field(None, description="文案 JSONL 路径")
     output_csv: Optional[str] = Field(None, description="输出 CSV 路径")
+    content_asset_comments_limit: int = Field(50, ge=1, le=5000)
+    content_asset_full_comments_limit: int = Field(200, ge=1, le=5000)
     project_dir: Optional[str] = Field(None, description="工作目录")
 
 
@@ -147,6 +164,14 @@ class RunAllRequest(BaseModel):
     """一键运行请求"""
     keywords: List[str] = Field(..., description="搜索关键词列表")
     max_count: int = Field(20, description="每个关键词最大采集数")
+    min_likes_threshold: int = Field(500, description="min likes threshold", ge=0)
+    force: bool = Field(False, description="ignore complete history index")
+    content_asset_comments_limit: int = Field(50, ge=1, le=5000)
+    content_asset_full_comments_limit: int = Field(200, ge=1, le=5000)
+    enable_region_title_filter: bool = Field(True)
+    enable_mandarin_filter: bool = Field(True)
+    skip_already_complete: bool = Field(True)
+    min_asr_text_length: int = Field(30, ge=0, le=1000)
     steps: Optional[List[str]] = Field(None, description="指定步骤（默认全部）")
     project_dir: Optional[str] = Field(None, description="工作目录")
 
@@ -155,6 +180,36 @@ class RunAllRequest(BaseModel):
 # 辅助函数
 # ═══════════════════════════════════════════════════════════════
 
+class ResumeRequest(BaseModel):
+    """Resume/repair an incomplete historical task."""
+    source_task_id: str = Field(..., description="历史任务 ID")
+    dimensions: List[Literal["comments", "scripts", "content_asset"]] = Field(
+        default_factory=lambda: ["scripts", "content_asset"],
+        description="需要补采的维度",
+    )
+    skip_complete: bool = Field(True, description="完整视频是否跳过")
+    max_count: Optional[int] = Field(None, description="最多处理视频数")
+    max_comments_per_video: int = Field(200, ge=1, le=5000)
+    force: bool = Field(False, description="是否强制重采完整视频")
+    model: Literal["tiny", "base", "small", "medium", "large"] = Field("small")
+    project_dir: Optional[str] = Field(None, description="工作目录")
+
+    @field_validator("dimensions")
+    @classmethod
+    def validate_dimensions(
+        cls,
+        value: List[Literal["comments", "scripts", "content_asset"]],
+    ) -> List[Literal["comments", "scripts", "content_asset"]]:
+        if not value:
+            raise ValueError("dimensions 不能为空")
+        return list(dict.fromkeys(value))
+
+
+def _media_crawler_root() -> Path:
+    """MediaCrawler repository root (contains main.py)."""
+    return Path(__file__).resolve().parents[1]
+
+
 def _make_scraper(project_dir: Optional[str], workspace: str) -> DouyinScraper:
     """
     创建 DouyinScraper 实例。
@@ -162,19 +217,19 @@ def _make_scraper(project_dir: Optional[str], workspace: str) -> DouyinScraper:
     ★ 我实际执行时：多个请求共享同一个 scraper 实例，
     状态互相覆盖 → 每个任务独立实例。★
 
-    Docker 环境检测：如果 /app/main.py 存在（Docker 容器），
-    使用 /app/ 作为 project_dir（MediaCrawler 项目根），
-    workspace 作为数据输出目录。
+    project_dir 始终为 MediaCrawler 项目根（含 main.py），
+    任务数据目录由 state_dir_name=workspaces/<task_id>/state 派生。
+    workspace 仅用于提取 task_id，不作为 project_dir。
     """
     if project_dir is None:
         # Docker 检测：/app/main.py 存在 → 容器环境
         if Path("/app/main.py").exists():
             project_dir = "/app/"
         else:
-            project_dir = workspace
+            project_dir = str(_media_crawler_root())
 
     # 每个任务使用独立的 state_dir，避免任务间状态污染
-    # workspace 格式: /app/workspaces/<task_id> → state_dir = /app/workspaces/<task_id>/state
+    # workspace 格式: .../workspaces/<task_id> → state_dir = workspaces/<task_id>/state
     ws_path = Path(workspace)
     task_id = ws_path.name  # 从 workspace 路径中提取 task_id
     state_dir_name = f"workspaces/{task_id}/state"
@@ -185,6 +240,22 @@ def _make_scraper(project_dir: Optional[str], workspace: str) -> DouyinScraper:
         "enable_cdp_mode": False,  # Docker 中不用 CDP，用 headless playwright
     }
     return DouyinScraper(config_dict)
+
+
+def _apply_collection_options(scraper: DouyinScraper, req: Any) -> None:
+    for attr in (
+        "min_likes_threshold",
+        "content_asset_comments_limit",
+        "content_asset_full_comments_limit",
+        "enable_region_title_filter",
+        "enable_mandarin_filter",
+        "skip_already_complete",
+        "min_asr_text_length",
+    ):
+        if hasattr(req, attr):
+            setattr(scraper.config, attr, getattr(req, attr))
+    if hasattr(req, "force"):
+        scraper.config.force_recollect_complete = bool(getattr(req, "force"))
 
 
 def _error_response(e: Exception) -> HTTPException:
@@ -218,6 +289,14 @@ def _search_output_result(paths: Dict[str, Any], output: Path) -> Dict[str, Any]
         "video_jsonl": paths.get("video_jsonl", str(output)),
         "video_csv": paths.get("video_csv", ""),
         "csv_stats": paths.get("csv_stats", {}),
+        "eligible_videos_jsonl": paths.get("eligible_videos_jsonl", ""),
+        "eligible_videos_csv": paths.get("eligible_videos_csv", ""),
+        "filtered_videos_jsonl": paths.get("filtered_videos_jsonl", ""),
+        "filtered_videos_csv": paths.get("filtered_videos_csv", ""),
+        "skipped_videos_jsonl": paths.get("skipped_videos_jsonl", ""),
+        "skipped_videos_csv": paths.get("skipped_videos_csv", ""),
+        "collection_filter_stats": paths.get("collection_filter_stats", {}),
+        "eligibility": (paths.get("collection_filter_stats", {}) or {}).get("eligibility", {}),
     }
 
 
@@ -273,6 +352,434 @@ def _script_output_result(
     }
 
 
+def _row_keys(row: Dict[str, Any]) -> List[str]:
+    keys: List[str] = []
+    for key in ("aweme_id", "video_id", "aweme_url", "video_url"):
+        value = str(row.get(key, "") or "").strip()
+        if value and value != "None" and value not in keys:
+            keys.append(value)
+    return keys
+
+
+def _row_matches_ids(row: Dict[str, Any], ids: set[str]) -> bool:
+    return any(key in ids for key in _row_keys(row))
+
+
+def _load_table_rows(csv_path: Path, jsonl_path: Optional[Path] = None) -> List[Dict[str, Any]]:
+    if csv_path.exists():
+        with open(str(csv_path), "r", encoding="utf-8-sig", newline="") as handle:
+            return [dict(row) for row in csv.DictReader(handle)]
+    if jsonl_path and jsonl_path.exists():
+        rows: List[Dict[str, Any]] = []
+        with open(str(jsonl_path), "r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                value = json.loads(line)
+                if isinstance(value, dict):
+                    rows.append(value)
+        return rows
+    return []
+
+
+def _fieldnames(rows: List[Dict[str, Any]], preferred: Optional[List[str]] = None) -> List[str]:
+    fields: List[str] = []
+    for field in preferred or []:
+        if field not in fields:
+            fields.append(field)
+    for row in rows:
+        for field in row.keys():
+            if field not in fields:
+                fields.append(field)
+    return fields
+
+
+def _write_table_rows(
+    rows: List[Dict[str, Any]],
+    csv_path: Path,
+    jsonl_path: Path,
+    *,
+    preferred_fieldnames: Optional[List[str]] = None,
+) -> None:
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = _fieldnames(rows, preferred_fieldnames)
+    with open(str(jsonl_path), "w", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+    with open(str(csv_path), "w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _copy_output_if_exists(source_dir: Path, target_dir: Path, name: str) -> None:
+    source = source_dir / name
+    if source.exists():
+        target_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, target_dir / name)
+
+
+def _copy_reusable_outputs(source_dir: Path, target_dir: Path) -> None:
+    for name in (
+        "search_result.csv",
+        "search_result.jsonl",
+        "search_title_clean.csv",
+        "search_title_clean.jsonl",
+        "comments_clean.csv",
+        "comments_clean.jsonl",
+        "comments_video_status.csv",
+        "comments_video_status.jsonl",
+        "script_sources.csv",
+        "script_sources.jsonl",
+        "script_raw.csv",
+        "script_raw.jsonl",
+        "script_clean.csv",
+        "script_clean.jsonl",
+    ):
+        _copy_output_if_exists(source_dir, target_dir, name)
+
+
+def _filter_rows_by_ids(rows: List[Dict[str, Any]], ids: set[str]) -> List[Dict[str, Any]]:
+    return [row for row in rows if _row_matches_ids(row, ids)]
+
+
+def _combine_single_rows_by_ids(
+    source_rows: List[Dict[str, Any]],
+    repair_rows: List[Dict[str, Any]],
+    repair_ids: set[str],
+) -> List[Dict[str, Any]]:
+    repair_by_key: Dict[str, Dict[str, Any]] = {}
+    for row in repair_rows:
+        for key in _row_keys(row):
+            repair_by_key[key] = row
+
+    combined: List[Dict[str, Any]] = []
+    used: set[int] = set()
+    for row in source_rows:
+        replacement: Optional[Dict[str, Any]] = None
+        if _row_matches_ids(row, repair_ids):
+            for key in _row_keys(row):
+                if key in repair_by_key:
+                    replacement = repair_by_key[key]
+                    used.add(id(replacement))
+                    break
+        combined.append(replacement or row)
+
+    for row in repair_rows:
+        if id(row) not in used:
+            combined.append(row)
+    return combined
+
+
+def _combine_multi_rows_by_ids(
+    source_rows: List[Dict[str, Any]],
+    repair_rows: List[Dict[str, Any]],
+    repair_ids: set[str],
+) -> List[Dict[str, Any]]:
+    kept = [row for row in source_rows if not _row_matches_ids(row, repair_ids)]
+    return kept + repair_rows
+
+
+def _video_ids_for_dimension(
+    report: Dict[str, Any],
+    dimension: str,
+    *,
+    skip_complete: bool,
+    force: bool,
+) -> List[str]:
+    if force or not skip_complete:
+        return [
+            str(row.get("aweme_id") or row.get("video_id"))
+            for row in report.get("videos", [])
+            if row.get("aweme_id") or row.get("video_id")
+        ]
+    return select_incomplete_videos(report, [dimension], force=False)
+
+
+def _resume_plan(
+    report: Dict[str, Any],
+    dimensions: List[str],
+    *,
+    skip_complete: bool,
+    force: bool,
+) -> Dict[str, Dict[str, int]]:
+    total = int(report.get("videos_total", 0))
+    planned: Dict[str, int] = {}
+    skipped: Dict[str, int] = {}
+    for dimension in ("comments", "scripts", "content_asset"):
+        if dimension not in dimensions:
+            planned[dimension] = 0
+            skipped[dimension] = total
+            continue
+        count = len(_video_ids_for_dimension(
+            report,
+            dimension,
+            skip_complete=skip_complete,
+            force=force,
+        ))
+        planned[dimension] = count
+        skipped[dimension] = max(total - count, 0)
+    return {"planned": planned, "skipped": skipped}
+
+
+def _ensure_repair_script_sources(
+    scraper: DouyinScraper,
+    repair_outputs: Path,
+) -> tuple[Path, Path]:
+    sources_jsonl = repair_outputs / "script_sources.jsonl"
+    sources_csv = repair_outputs / "script_sources.csv"
+    if sources_jsonl.exists() or sources_csv.exists():
+        return sources_jsonl, sources_csv
+
+    search_csv = repair_outputs / "search_result.csv"
+    if not search_csv.exists():
+        raise NonRetryableError(
+            "resume source task has no search_result.csv for script repair",
+            step="resume",
+        )
+    search_jsonl = repair_outputs / "search_result.jsonl"
+    title_clean_csv = repair_outputs / "search_title_clean.csv"
+    scraper._do_build_script_sources(
+        search_csv,
+        search_jsonl if search_jsonl.exists() else None,
+        title_clean_csv if title_clean_csv.exists() else None,
+    )
+    return sources_jsonl, sources_csv
+
+
+def _repair_comments(
+    scraper: DouyinScraper,
+    source_outputs: Path,
+    repair_outputs: Path,
+    comment_ids: List[str],
+    max_comments_per_video: int,
+) -> Dict[str, Any]:
+    if not comment_ids:
+        return {"comments_repaired": 0}
+
+    id_set = set(comment_ids)
+    search_rows = _load_table_rows(
+        source_outputs / "search_result.csv",
+        source_outputs / "search_result.jsonl",
+    )
+    input_rows = _filter_rows_by_ids(search_rows, id_set)
+    repair_input = repair_outputs / "repair_input_videos.jsonl"
+    _write_table_rows(
+        input_rows,
+        repair_outputs / "repair_input_videos.csv",
+        repair_input,
+    )
+    comments_jsonl = scraper.fetch_comments(
+        video_jsonl=repair_input,
+        max_comments_per_video=max_comments_per_video,
+    )
+    paths = scraper.get_paths()
+    repair_clean_csv = Path(paths.get("comments_clean_csv", repair_outputs / "comments_clean.csv"))
+    repair_clean_jsonl = Path(paths.get("comments_clean_jsonl", repair_outputs / "comments_clean.jsonl"))
+    if repair_clean_csv.exists():
+        shutil.copyfile(repair_clean_csv, repair_outputs / "comments_clean_repair.csv")
+    if repair_clean_jsonl.exists():
+        shutil.copyfile(repair_clean_jsonl, repair_outputs / "comments_clean_repair.jsonl")
+    if Path(comments_jsonl).exists():
+        shutil.copyfile(Path(comments_jsonl), repair_outputs / "comments_raw_repair.jsonl")
+
+    source_clean_rows = _load_table_rows(
+        source_outputs / "comments_clean.csv",
+        source_outputs / "comments_clean.jsonl",
+    )
+    repair_clean_rows = _load_table_rows(repair_clean_csv, repair_clean_jsonl)
+    combined_clean = _combine_multi_rows_by_ids(source_clean_rows, repair_clean_rows, id_set)
+    _write_table_rows(
+        combined_clean,
+        repair_outputs / "comments_clean.csv",
+        repair_outputs / "comments_clean.jsonl",
+    )
+    return {
+        "comments_repaired": len(comment_ids),
+        "comments_jsonl": str(comments_jsonl),
+        "comments_clean_csv": str(repair_outputs / "comments_clean.csv"),
+    }
+
+
+def _repair_scripts(
+    scraper: DouyinScraper,
+    source_outputs: Path,
+    repair_outputs: Path,
+    script_ids: List[str],
+    model: str,
+) -> Dict[str, Any]:
+    if not script_ids:
+        return {"scripts_repaired": 0}
+
+    id_set = set(script_ids)
+    full_sources_jsonl, full_sources_csv = _ensure_repair_script_sources(
+        scraper,
+        repair_outputs,
+    )
+    source_rows = _load_table_rows(full_sources_csv, full_sources_jsonl)
+    repair_sources = _filter_rows_by_ids(source_rows, id_set)
+    repair_sources_csv = repair_outputs / "script_sources_repair.csv"
+    repair_sources_jsonl = repair_outputs / "script_sources_repair.jsonl"
+    _write_table_rows(repair_sources, repair_sources_csv, repair_sources_jsonl)
+
+    raw_jsonl, raw_csv, raw_stats = scraper._do_build_script_raw(
+        script_sources_jsonl=repair_sources_jsonl,
+        script_sources_csv=repair_sources_csv,
+        model_name=model,
+        max_items=len(repair_sources),
+    )
+    shutil.copyfile(raw_jsonl, repair_outputs / "script_raw_repair.jsonl")
+    shutil.copyfile(raw_csv, repair_outputs / "script_raw_repair.csv")
+
+    source_raw_rows = _load_table_rows(
+        source_outputs / "script_raw.csv",
+        source_outputs / "script_raw.jsonl",
+    )
+    repair_raw_rows = _load_table_rows(raw_csv, raw_jsonl)
+    combined_raw_rows = _combine_single_rows_by_ids(source_raw_rows, repair_raw_rows, id_set)
+    combined_raw_csv = repair_outputs / "script_raw.csv"
+    combined_raw_jsonl = repair_outputs / "script_raw.jsonl"
+    _write_table_rows(
+        combined_raw_rows,
+        combined_raw_csv,
+        combined_raw_jsonl,
+        preferred_fieldnames=scraper._script_raw_fieldnames(),
+    )
+
+    title_clean_csv = repair_outputs / "search_title_clean.csv"
+    clean_jsonl, clean_csv, clean_stats = scraper._do_build_script_clean(
+        script_sources_jsonl=full_sources_jsonl,
+        script_sources_csv=full_sources_csv,
+        script_raw_jsonl=combined_raw_jsonl,
+        script_raw_csv=combined_raw_csv,
+        title_clean_csv=title_clean_csv if title_clean_csv.exists() else None,
+    )
+    return {
+        "scripts_repaired": len(script_ids),
+        "script_raw_repair_jsonl": str(repair_outputs / "script_raw_repair.jsonl"),
+        "script_raw_jsonl": str(combined_raw_jsonl),
+        "script_raw_csv": str(combined_raw_csv),
+        "script_raw_stats": raw_stats,
+        "script_clean_jsonl": str(clean_jsonl),
+        "script_clean_csv": str(clean_csv),
+        "script_clean_stats": clean_stats,
+    }
+
+
+def _run_resume_repair(
+    req: ResumeRequest,
+    source_task: Any,
+    repair_task: Any,
+) -> Dict[str, Any]:
+    source_workspace = Path(source_task.workspace)
+    source_outputs = source_workspace / "outputs"
+    repair_workspace = Path(repair_task.workspace)
+    repair_outputs = repair_workspace / "outputs"
+    repair_outputs.mkdir(parents=True, exist_ok=True)
+    (repair_workspace / "source_task_id.txt").write_text(req.source_task_id, encoding="utf-8")
+
+    source_report = write_task_completeness_report(
+        source_workspace,
+        task_id=req.source_task_id,
+    )
+    plan = _resume_plan(
+        source_report,
+        list(req.dimensions),
+        skip_complete=req.skip_complete,
+        force=req.force,
+    )
+    _copy_reusable_outputs(source_outputs, repair_outputs)
+
+    scraper = _make_scraper(req.project_dir, repair_task.workspace)
+    scraper.config.max_videos_per_keyword = req.max_count or int(source_report.get("videos_total", 0) or 1)
+    scraper.config.max_script_raw_items = scraper.config.max_videos_per_keyword
+    scraper.config.whisper_model = req.model
+
+    comments_ids = _video_ids_for_dimension(
+        source_report,
+        "comments",
+        skip_complete=req.skip_complete,
+        force=req.force,
+    ) if "comments" in req.dimensions else []
+    script_ids = _video_ids_for_dimension(
+        source_report,
+        "scripts",
+        skip_complete=req.skip_complete,
+        force=req.force,
+    ) if "scripts" in req.dimensions else []
+
+    comments_result = _repair_comments(
+        scraper,
+        source_outputs,
+        repair_outputs,
+        comments_ids,
+        req.max_comments_per_video,
+    )
+    scripts_result = _repair_scripts(
+        scraper,
+        source_outputs,
+        repair_outputs,
+        script_ids,
+        req.model,
+    )
+
+    if "content_asset" in req.dimensions or script_ids or comments_ids:
+        jsonl_path, csv_path, asset_stats = scraper.build_content_asset(
+            search_outputs_dir=repair_outputs,
+            comments_outputs_dir=repair_outputs,
+            scripts_outputs_dir=repair_outputs,
+        )
+    else:
+        jsonl_path = repair_outputs / "content_asset.jsonl"
+        csv_path = repair_outputs / "content_asset.csv"
+        asset_stats = {}
+
+    repair_report = write_task_completeness_report(
+        repair_workspace,
+        task_id=repair_task.task_id,
+    )
+    videos_total = int(source_report.get("videos_total", 0))
+    result = {
+        "resume_mode": True,
+        "source_task_id": req.source_task_id,
+        "repair_task_id": repair_task.task_id,
+        "videos_total": videos_total,
+        "videos_reused": max(videos_total - len(set(comments_ids + script_ids)), 0),
+        "videos_repaired": len(set(comments_ids + script_ids)),
+        "comments_reused": plan["skipped"]["comments"],
+        "comments_repaired": len(comments_ids),
+        "scripts_reused": plan["skipped"]["scripts"],
+        "scripts_repaired": len(script_ids),
+        "planned": plan["planned"],
+        "skipped": plan["skipped"],
+        "collection_status": "repaired",
+        "content_asset_jsonl": str(jsonl_path),
+        "content_asset_full_csv": str(csv_path.with_name("content_asset_full.csv")),
+        "content_asset_csv": str(csv_path),
+        "content_asset_stats": asset_stats,
+        "source_completeness": {
+            "videos_total": source_report.get("videos_total", 0),
+            "videos_complete": source_report.get("videos_complete", 0),
+            "videos_incomplete": source_report.get("videos_incomplete", 0),
+            "dimensions": source_report.get("dimensions", {}),
+            "incomplete_reasons": source_report.get("incomplete_reasons", {}),
+            "files": source_report.get("files", {}),
+        },
+        "repair_completeness": {
+            "videos_total": repair_report.get("videos_total", 0),
+            "videos_complete": repair_report.get("videos_complete", 0),
+            "videos_incomplete": repair_report.get("videos_incomplete", 0),
+            "dimensions": repair_report.get("dimensions", {}),
+            "incomplete_reasons": repair_report.get("incomplete_reasons", {}),
+            "files": repair_report.get("files", {}),
+        },
+    }
+    result.update(comments_result)
+    result.update(scripts_result)
+    return result
+
+
 # Search endpoint
 
 @router.post("/search", summary="触发搜索采集")
@@ -288,6 +795,7 @@ async def search(req: SearchRequest) -> Dict[str, Any]:
     def _do_search() -> Dict[str, Any]:
         logger.info("API search request task_id=%s keywords=%r", task.task_id, req.keywords)
         scraper = _make_scraper(req.project_dir, task.workspace)
+        _apply_collection_options(scraper, req)
         output = scraper.search(keywords=req.keywords, max_count=req.max_count)
         paths = scraper.get_paths()
         result = _search_output_result(paths, output)
@@ -372,6 +880,15 @@ async def extract_scripts(req: ScriptsRequest) -> Dict[str, Any]:
                     f"搜索任务不存在: {req.task_id}",
                     step="extract_scripts",
                 )
+            try:
+                source_max_count = source_task.params.get("max_count")
+                if source_max_count is not None:
+                    scraper.config.max_videos_per_keyword = int(source_max_count)
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Invalid source task max_count for scripts task: task_id=%s",
+                    req.task_id,
+                )
             source_outputs = Path(source_task.workspace) / "outputs"
             jsonl_path = source_outputs / "script_sources.jsonl"
             csv_path = source_outputs / "script_sources.csv"
@@ -440,6 +957,7 @@ async def merge(req: MergeRequest) -> Dict[str, Any]:
 
     def _do_merge() -> Dict[str, Any]:
         scraper = _make_scraper(req.project_dir, task.workspace)
+        _apply_collection_options(scraper, req)
         if req.search_task_id:
             search_task = tm.get_task(req.search_task_id)
             if not search_task or search_task.status != "completed":
@@ -482,6 +1000,7 @@ async def merge(req: MergeRequest) -> Dict[str, Any]:
             )
             return {
                 "content_asset_jsonl": str(jsonl_path),
+                "content_asset_full_csv": str(csv_path.with_name("content_asset_full.csv")),
                 "content_asset_csv": str(csv_path),
                 "content_asset_stats": stats,
                 "status": scraper.get_status(),
@@ -522,16 +1041,69 @@ async def run_all(req: RunAllRequest) -> Dict[str, Any]:
     task = tm.create_task("run_all", params=req.model_dump())
 
     def _do_run_all() -> Dict[str, Any]:
-        config_dict: Dict[str, Any] = {
-            "project_dir": req.project_dir or task.workspace,
-            "keywords": req.keywords,
-            "max_videos_per_keyword": req.max_count,
-        }
-        scraper = DouyinScraper(config_dict)
-        return scraper.run_all(steps=req.steps)
+        scraper = _make_scraper(req.project_dir, task.workspace)
+        scraper.config.keywords = req.keywords
+        scraper.config.max_videos_per_keyword = req.max_count
+        _apply_collection_options(scraper, req)
+        result = scraper.run_all(steps=req.steps)
+        if result.get("error"):
+            error = str(result.get("error") or "run_all failed")
+            step = str(result.get("error_step") or "")
+            exit_code = result.get("exit_code")
+            if exit_code == 1:
+                raise RetryableError(error, step=step)
+            if exit_code == 3:
+                raise FatalError(error, step=step)
+            raise NonRetryableError(error, step=step)
+        return result
 
     tm.submit(task, _do_run_all)
     return {"task_id": task.task_id, "status": "submitted", "type": "run_all"}
+
+
+@router.post("/resume", summary="从历史任务续采缺失数据")
+async def resume_task(req: ResumeRequest) -> Dict[str, Any]:
+    tm = get_task_manager()
+    if not tm.is_valid_task_id(req.source_task_id):
+        raise HTTPException(status_code=400, detail="无效 source_task_id")
+    source_task = tm.get_task(req.source_task_id)
+    if not source_task:
+        raise HTTPException(status_code=404, detail=f"任务不存在: {req.source_task_id}")
+    source_workspace = Path(source_task.workspace)
+    if not source_workspace.exists():
+        raise HTTPException(status_code=404, detail="源任务 workspace 不存在")
+
+    source_report = write_task_completeness_report(
+        source_workspace,
+        task_id=req.source_task_id,
+    )
+    plan = _resume_plan(
+        source_report,
+        list(req.dimensions),
+        skip_complete=req.skip_complete,
+        force=req.force,
+    )
+    task = tm.create_task("resume", params=req.model_dump())
+
+    def _do_resume() -> Dict[str, Any]:
+        return _run_resume_repair(req, source_task, task)
+
+    tm.submit(task, _do_resume)
+    return {
+        "repair_task_id": task.task_id,
+        "task_id": task.task_id,
+        "source_task_id": req.source_task_id,
+        "status": "submitted",
+        "type": "resume",
+        "data_quality_status": "repairing",
+        "data_quality_message": "正在补全缺失数据",
+        "planned": plan["planned"],
+        "skipped": plan["skipped"],
+        "videos_total": source_report.get("videos_total", 0),
+        "videos_complete": source_report.get("videos_complete", 0),
+        "videos_incomplete": source_report.get("videos_incomplete", 0),
+        "incomplete_reasons": source_report.get("incomplete_reasons", {}),
+    }
 
 
 @router.get("/status/{task_id}", summary="查询任务状态")
@@ -791,6 +1363,25 @@ async def list_data_files() -> Dict[str, Any]:
     # 按完成时间降序
     items.sort(key=lambda x: x["created_at"], reverse=True)
     return {"items": items, "total": len(items)}
+
+
+@router.get("/data/completeness", summary="检查任务数据完整性")
+async def data_completeness(
+    task_id: str = Query(..., description="任务 ID"),
+) -> Dict[str, Any]:
+    tm = get_task_manager()
+    if not tm.is_valid_task_id(task_id):
+        raise HTTPException(status_code=400, detail="无效 task_id")
+    task = tm.get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail=f"任务不存在: {task_id}")
+    workspace = Path(task.workspace)
+    if not workspace.exists():
+        raise HTTPException(status_code=404, detail="任务 workspace 不存在")
+    report = write_task_completeness_report(workspace, task_id=task_id)
+    update_video_completeness_index(workspace, task_id=task_id, report=report)
+    tm.update_task_data_quality(task_id, report)
+    return report
 
 
 @router.get("/data/preview/{task_id}", summary="预览任务结果数据")

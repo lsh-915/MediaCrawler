@@ -61,6 +61,15 @@ class ScraperConfig:
         self.whisper_model: str = "small"
         self.keep_videos: bool = False
         self.max_workers: int = 1
+        self.max_script_raw_items: Optional[int] = None
+        self.min_likes_threshold: int = 500
+        self.force_recollect_complete: bool = False
+        self.content_asset_comments_limit: int = 50
+        self.content_asset_full_comments_limit: int = 200
+        self.enable_region_title_filter: bool = True
+        self.enable_mandarin_filter: bool = True
+        self.skip_already_complete: bool = True
+        self.min_asr_text_length: int = 30
 
         # 加载配置
         if config is not None:
@@ -136,10 +145,68 @@ class ScraperConfig:
                     f"max_workers 必须是整数: {data.get('max_workers')}",
                     step="config",
                 ) from e
+        if "max_script_raw_items" in data:
+            value = data["max_script_raw_items"]
+            if value in (None, ""):
+                self.max_script_raw_items = None
+            else:
+                try:
+                    self.max_script_raw_items = int(value)
+                except (ValueError, TypeError) as e:
+                    raise ConfigError(
+                        f"max_script_raw_items must be int: {value}",
+                        step="config",
+                    ) from e
+        if "min_likes_threshold" in data:
+            try:
+                self.min_likes_threshold = int(data["min_likes_threshold"])
+            except (ValueError, TypeError) as e:
+                raise ConfigError(
+                    f"min_likes_threshold must be int: {data.get('min_likes_threshold')}",
+                    step="config",
+                ) from e
+        if "force_recollect_complete" in data:
+            self.force_recollect_complete = self._coerce_bool(data["force_recollect_complete"])
+        if "content_asset_comments_limit" in data:
+            try:
+                self.content_asset_comments_limit = int(data["content_asset_comments_limit"])
+            except (ValueError, TypeError) as e:
+                raise ConfigError(
+                    f"content_asset_comments_limit must be int: {data.get('content_asset_comments_limit')}",
+                    step="config",
+                ) from e
+        if "content_asset_full_comments_limit" in data:
+            try:
+                self.content_asset_full_comments_limit = int(data["content_asset_full_comments_limit"])
+            except (ValueError, TypeError) as e:
+                raise ConfigError(
+                    f"content_asset_full_comments_limit must be int: {data.get('content_asset_full_comments_limit')}",
+                    step="config",
+                ) from e
+        if "enable_region_title_filter" in data:
+            self.enable_region_title_filter = self._coerce_bool(data["enable_region_title_filter"])
+        if "enable_mandarin_filter" in data:
+            self.enable_mandarin_filter = self._coerce_bool(data["enable_mandarin_filter"])
+        if "skip_already_complete" in data:
+            self.skip_already_complete = self._coerce_bool(data["skip_already_complete"])
+        if "min_asr_text_length" in data:
+            try:
+                self.min_asr_text_length = int(data["min_asr_text_length"])
+            except (ValueError, TypeError) as e:
+                raise ConfigError(
+                    f"min_asr_text_length must be int: {data.get('min_asr_text_length')}",
+                    step="config",
+                ) from e
         if "state_dir_name" in data:
             self.state_dir_name = str(data["state_dir_name"])
         if "retry" in data:
             self.retry = RetryConfig(**data["retry"])
+
+    @staticmethod
+    def _coerce_bool(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
 
     def _load_dotenv(self, path: Path) -> None:
         """
@@ -215,6 +282,21 @@ class ScraperConfig:
             errors.append(f"无效端口: {self.chrome_debugging_port}")
         if self.retry.max_attempts < 1:
             errors.append("retry.max_attempts 必须 >= 1")
+        if self.max_script_raw_items is not None and self.max_script_raw_items < 0:
+            errors.append(f"max_script_raw_items must be >= 0, current: {self.max_script_raw_items}")
+        if self.min_likes_threshold < 0:
+            errors.append(f"min_likes_threshold must be >= 0, current: {self.min_likes_threshold}")
+        if self.content_asset_comments_limit < 1:
+            errors.append(
+                f"content_asset_comments_limit must be >= 1, current: {self.content_asset_comments_limit}"
+            )
+        if self.content_asset_full_comments_limit < 1:
+            errors.append(
+                "content_asset_full_comments_limit must be >= 1, "
+                f"current: {self.content_asset_full_comments_limit}"
+            )
+        if self.min_asr_text_length < 0:
+            errors.append(f"min_asr_text_length must be >= 0, current: {self.min_asr_text_length}")
         if self.max_videos_per_keyword < 1:
             errors.append(f"max_videos_per_keyword 必须 >= 1, 当前: {self.max_videos_per_keyword}")
         if not isinstance(self.keywords, list):

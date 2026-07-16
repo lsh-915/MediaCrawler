@@ -32,6 +32,7 @@ import PlayArrowIcon from '@mui/icons-material/PlayArrow';
 import { useParams, useNavigate } from 'react-router-dom';
 import { useTaskStore } from '../store/useTaskStore';
 import { api } from '../api/client';
+import type { CompletenessReport, RepairDimension } from '../api/types';
 import StatusBadge from '../components/task/StatusBadge';
 import LoadingOverlay from '../components/shared/LoadingOverlay';
 import ErrorAlert from '../components/shared/ErrorAlert';
@@ -355,7 +356,252 @@ function ResultSection({ task }: { task: any }) {
 
 // ─── 错误组件 ─────────────────────────────────────────────────
 
-function ErrorSection({ error, exitCode }: { error: string; exitCode: number }) {
+function DataQualitySection({
+  task,
+  onRefreshTask,
+}: {
+  task: any;
+  onRefreshTask: () => void;
+}) {
+  const initialStatus = task.data_quality_status || task.result?.data_quality_status || null;
+  const [quality, setQuality] = useState<CompletenessReport | null>(null);
+  const [checking, setChecking] = useState(false);
+  const [repairing, setRepairing] = useState(false);
+  const [repairTaskId, setRepairTaskId] = useState<string | null>(null);
+  const [qualityError, setQualityError] = useState<string | null>(null);
+  const dimensions = quality?.dimensions || task.result?.completeness?.dimensions || {};
+  const recommendedDimensions = (
+    quality?.recommended_repair_dimensions
+    || task.recommended_repair_dimensions
+    || task.result?.recommended_repair_dimensions
+    || []
+  ) as RepairDimension[];
+  const status = quality?.data_quality_status || initialStatus || 'incomplete';
+  const message =
+    quality?.data_quality_message
+    || quality?.message
+    || task.data_quality_message
+    || task.result?.data_quality_message
+    || (status === 'complete' ? '数据采集完整' : '采集不全，请补全');
+  const filterStats = quality?.collection_filter_stats || task.result?.collection_filter_stats || {};
+  const eligibility = filterStats.eligibility || task.result?.eligibility || {};
+  const statValue = (key: string) => eligibility[key] ?? filterStats[key] ?? 0;
+  const filterSummary = [
+    ['eligible_videos', '可采视频'],
+    ['filtered_total', '过滤总数'],
+    ['filtered_low_likes', '低赞过滤'],
+    ['filtered_missing_likes', '缺赞过滤'],
+    ['filtered_not_video', '非视频'],
+    ['filtered_note_post', '图文作品'],
+    ['filtered_missing_video_url', '缺视频地址'],
+    ['filtered_zero_duration', '零时长'],
+    ['filtered_audio_only', '音频作品'],
+    ['filtered_region_title', '地域标题'],
+    ['filtered_non_mandarin', '非普通话'],
+    ['filtered_asr_too_short', 'ASR 过短'],
+    ['filtered_asr_language_not_zh', '非中文 ASR'],
+    ['skipped_already_complete', '历史完整跳过'],
+  ] as const;
+  const missingScripts = dimensions.scripts?.incomplete ?? 0;
+  const missingComments = dimensions.comments?.incomplete ?? 0;
+  const missingAssets = dimensions.content_asset?.incomplete ?? 0;
+  const isRecoveryMode = task.status === 'failed';
+  const canRepair = Boolean(
+    repairing
+    || quality?.repair_available
+    || task.repair_available
+    || recommendedDimensions.length > 0
+  );
+
+  const handleCheck = async () => {
+    setChecking(true);
+    setQualityError(null);
+    try {
+      const report = await api.checkCompleteness(task.task_id);
+      setQuality(report);
+      onRefreshTask();
+    } catch (err) {
+      setQualityError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setChecking(false);
+    }
+  };
+
+  const handleRepair = async () => {
+    const dims = recommendedDimensions.length
+      ? recommendedDimensions
+      : (['comments', 'scripts', 'content_asset'] as RepairDimension[]);
+    setRepairing(true);
+    setQualityError(null);
+    try {
+      const response = await api.resumeTask({
+        source_task_id: task.task_id,
+        dimensions: dims,
+        skip_complete: true,
+        force: false,
+      });
+      setRepairTaskId(response.repair_task_id);
+      setQuality((prev) => ({
+        ...(prev || {
+          task_id: task.task_id,
+          data_quality_status: 'repairing',
+          videos_total: 0,
+          videos_complete: 0,
+          videos_incomplete: 0,
+          dimensions: {},
+          repair_available: false,
+          recommended_repair_dimensions: dims,
+        }),
+        data_quality_status: 'repairing',
+        data_quality_message: '正在补全缺失数据',
+        message: '正在补全缺失数据',
+        repair_available: false,
+      }));
+      onRefreshTask();
+    } catch (err) {
+      setQualityError(err instanceof Error ? err.message : String(err));
+      setRepairing(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!['completed', 'failed'].includes(task.status) || quality || checking || initialStatus) return;
+    void handleCheck();
+  }, [task.status, task.task_id]);
+
+  useEffect(() => {
+    if (!repairTaskId) return undefined;
+    const timer = setInterval(() => {
+      void (async () => {
+        const repairTask = await api.getTaskStatus(repairTaskId);
+        if (repairTask.status === 'completed') {
+          clearInterval(timer);
+          setRepairing(false);
+          const report = await api.checkCompleteness(repairTaskId);
+          setQuality(report);
+          onRefreshTask();
+        } else if (repairTask.status === 'failed') {
+          clearInterval(timer);
+          setRepairing(false);
+          setQualityError(repairTask.error || '补全任务失败');
+        }
+      })();
+    }, 5000);
+    return () => clearInterval(timer);
+  }, [repairTaskId, onRefreshTask]);
+
+  const severity =
+    status === 'complete' ? 'success' :
+    status === 'repairing' || repairing ? 'info' :
+    status === 'failed' ? 'error' :
+    'warning';
+
+  return (
+    <Card id={isRecoveryMode ? 'task-recovery-panel' : undefined} sx={{ mb: 3, border: '1px solid #90a4ae' }}>
+      <CardContent>
+        <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 2, mb: 1.5, flexWrap: 'wrap' }}>
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+            {status === 'complete' ? (
+              <CheckCircleOutlineIcon color="success" />
+            ) : (
+              <ErrorOutlineIcon color={severity === 'error' ? 'error' : 'warning'} />
+            )}
+            <Typography variant="subtitle1" fontWeight={700}>
+              {isRecoveryMode ? '继续处理' : '数据完整性检查'}
+            </Typography>
+          </Box>
+          <Chip
+            size="small"
+            color={severity as 'success' | 'info' | 'warning' | 'error'}
+            label={message}
+            variant="outlined"
+          />
+        </Box>
+
+        {isRecoveryMode && (
+          <Alert severity="info" sx={{ mb: 1.5 }}>
+            已产出的搜索、评论和中间文件会被复用。可以先检查完整性，再补全文案或内容资产。
+          </Alert>
+        )}
+
+        <Box sx={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(120px, 1fr))', gap: 1, mb: 2 }}>
+          <Paper variant="outlined" sx={{ p: 1 }}>
+            <Typography variant="caption" color="text.secondary">文案缺失</Typography>
+            <Typography variant="body2" fontWeight={700}>{missingScripts}</Typography>
+          </Paper>
+          <Paper variant="outlined" sx={{ p: 1 }}>
+            <Typography variant="caption" color="text.secondary">评论缺失</Typography>
+            <Typography variant="body2" fontWeight={700}>{missingComments}</Typography>
+          </Paper>
+          <Paper variant="outlined" sx={{ p: 1 }}>
+            <Typography variant="caption" color="text.secondary">内容资产缺失</Typography>
+            <Typography variant="body2" fontWeight={700}>{missingAssets}</Typography>
+          </Paper>
+          {filterSummary.map(([key, label]) => (
+            <Paper variant="outlined" sx={{ p: 1 }} key={key}>
+              <Typography variant="caption" color="text.secondary">{label}</Typography>
+              <Typography variant="body2" fontWeight={700}>{statValue(key)}</Typography>
+            </Paper>
+          ))}
+        </Box>
+
+        {repairTaskId && (
+          <Alert severity="info" sx={{ mb: 1.5 }}>
+            repair task: {repairTaskId}
+          </Alert>
+        )}
+        {qualityError && (
+          <Alert severity="error" sx={{ mb: 1.5 }}>
+            {qualityError}
+          </Alert>
+        )}
+
+        <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap' }}>
+          <Button
+            size="small"
+            variant="outlined"
+            startIcon={<RefreshIcon />}
+            onClick={handleCheck}
+            disabled={checking || repairing}
+          >
+            {checking ? '检查中...' : '检查完整性'}
+          </Button>
+          {status !== 'complete' && canRepair && (
+            <Button
+              size="small"
+              variant="contained"
+              color="warning"
+              startIcon={<PlayArrowIcon />}
+              onClick={handleRepair}
+              disabled={checking || repairing}
+            >
+              {repairing ? '正在补全...' : '补全缺失数据'}
+            </Button>
+          )}
+          {repairTaskId && (
+            <Button
+              size="small"
+              variant="text"
+              onClick={() => window.location.assign(`/tasks/${repairTaskId}`)}
+            >
+              查看补全进度
+            </Button>
+          )}
+        </Box>
+      </CardContent>
+    </Card>
+  );
+}
+
+function ErrorSection({
+  error,
+  exitCode,
+  canRecover = false,
+}: {
+  error: string;
+  exitCode: number;
+  canRecover?: boolean;
+}) {
   const [showRaw, setShowRaw] = useState(false);
 
   const exitCodeLabel: Record<number, { label: string; color: 'warning' | 'error' | 'info' }> = {
@@ -392,6 +638,25 @@ function ErrorSection({ error, exitCode }: { error: string; exitCode: number }) 
           <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
             容器重启或进程退出导致任务中断。已采集的数据保存在 workspace 中，可以重新执行任务。
           </Typography>
+        )}
+
+        {isInterrupted && canRecover && (
+          <Alert
+            severity="info"
+            sx={{ mb: 1.5 }}
+            action={(
+              <Button
+                color="inherit"
+                size="small"
+                startIcon={<PlayArrowIcon />}
+                onClick={() => document.getElementById('task-recovery-panel')?.scrollIntoView({ behavior: 'smooth', block: 'start' })}
+              >
+                去继续处理
+              </Button>
+            )}
+          >
+            已采集的数据不会丢失。使用“继续处理”里的检查完整性和补全缺失数据，可以从已有结果继续。
+          </Alert>
         )}
 
         <Typography variant="body2" color={isInterrupted ? 'text.primary' : 'error.main'} sx={{ mb: 1 }}>
@@ -486,6 +751,7 @@ export default function TaskDetailPage() {
   const isRunning = currentTask.status === 'running';
   const isFailed  = currentTask.status === 'failed';
   const isDone    = currentTask.status === 'completed';
+  const canRecoverFailedTask = isFailed && ['run_all', 'resume'].includes(currentTask.task_type);
 
   return (
     <Box>
@@ -552,6 +818,14 @@ export default function TaskDetailPage() {
                   {typeLabel}
                 </Typography>
                 <StatusBadge status={currentTask.status} />
+                {canRecoverFailedTask && (
+                  <Chip
+                    label="可继续处理"
+                    size="small"
+                    color="warning"
+                    variant="outlined"
+                  />
+                )}
                 {isRunning && elapsed && (
                   <Chip
                     icon={<HourglassTopIcon sx={{ fontSize: '14px !important' }} />}
@@ -774,15 +1048,33 @@ export default function TaskDetailPage() {
 
           {/* 结果 */}
           {isDone && (
+            <DataQualitySection
+              task={currentTask}
+              onRefreshTask={() => taskId && fetchTaskDetail(taskId)}
+            />
+          )}
+
+          {isDone && (
             <Box sx={{ mb: 3 }}>
               <ResultSection task={currentTask} />
             </Box>
           )}
 
+          {canRecoverFailedTask && (
+            <DataQualitySection
+              task={currentTask}
+              onRefreshTask={() => taskId && fetchTaskDetail(taskId)}
+            />
+          )}
+
           {/* 错误 */}
           {isFailed && currentTask.error && (
             <Box sx={{ mb: 3 }}>
-              <ErrorSection error={currentTask.error} exitCode={currentTask.exit_code} />
+              <ErrorSection
+                error={currentTask.error}
+                exitCode={currentTask.exit_code}
+                canRecover={canRecoverFailedTask}
+              />
             </Box>
           )}
 

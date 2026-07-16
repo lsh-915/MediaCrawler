@@ -40,6 +40,19 @@ CONTENT_ASSET_FIELDNAMES = [
     "created_at",
 ]
 
+STANDARD_OUTPUT_FIELDNAMES = [
+    "video_id",
+    "platform",
+    "script_text",
+    "likes",
+    "favorites",
+    "shares",
+    "comments",
+]
+STANDARD_OUTPUT_MAX_ROWS = 200
+STANDARD_OUTPUT_MIN_SCRIPT_CHARS = 10
+STANDARD_OUTPUT_MAX_COMMENTS_PER_VIDEO = 50
+FULL_OUTPUT_MAX_COMMENTS_PER_VIDEO = 200
 
 _MATCH_FIELDS = ("aweme_id", "video_id", "aweme_url")
 _COMMENT_MATCH_FIELDS = ("aweme_id", "video_id")
@@ -55,7 +68,14 @@ def _empty_stats() -> Dict[str, Any]:
         "asr_available": 0,
         "fallback_script_total": 0,
         "missing_script_total": 0,
+        "standard_rows_out": 0,
+        "standard_rows_skipped": 0,
+        "content_asset_comments_limit": STANDARD_OUTPUT_MAX_COMMENTS_PER_VIDEO,
+        "content_asset_full_comments_limit": FULL_OUTPUT_MAX_COMMENTS_PER_VIDEO,
+        "content_asset_rows": 0,
+        "content_asset_full_rows": 0,
         "content_asset_csv_generated": False,
+        "content_asset_full_csv_generated": False,
         "errors": [],
     }
 
@@ -76,6 +96,18 @@ def _safe_int(value: Any) -> int:
         return int(float(str(value).strip()))
     except (TypeError, ValueError):
         return 0
+
+
+def _coerce_limit(value: Optional[int], default: int, *, minimum: int = 1, maximum: int = 5000) -> int:
+    try:
+        if value is None:
+            return default
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    if parsed < minimum or parsed > maximum:
+        return default
+    return parsed
 
 
 def _truthy(value: Any) -> bool:
@@ -142,7 +174,11 @@ def _split_tags(value: Any) -> List[str]:
     return tags
 
 
-def _aggregate_comments(rows: Iterable[Dict[str, Any]]) -> Dict[str, Dict[str, Dict[str, Any]]]:
+def _aggregate_comments(
+    rows: Iterable[Dict[str, Any]],
+    *,
+    comments_limit: int,
+) -> Dict[str, Dict[str, Dict[str, Any]]]:
     grouped: Dict[str, Dict[str, Any]] = {}
     aliases: Dict[str, str] = {}
 
@@ -155,7 +191,7 @@ def _aggregate_comments(rows: Iterable[Dict[str, Any]]) -> Dict[str, Dict[str, D
         bucket = grouped.setdefault(primary, {"count": 0, "comments": [], "tags": []})
         bucket["count"] += 1
         clean_content = _text(row.get("clean_content"))
-        if clean_content and len(bucket["comments"]) < 3:
+        if clean_content and len(bucket["comments"]) < comments_limit:
             bucket["comments"].append(clean_content)
         bucket["tags"].extend(_split_tags(row.get("pain_tags")))
 
@@ -239,6 +275,23 @@ def _asset_quality(row: Dict[str, Any]) -> str:
     return "low"
 
 
+def _standard_output_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "video_id": _text(row.get("video_id")) or _text(row.get("aweme_id")),
+        "platform": _text(row.get("platform")) or "douyin",
+        "script_text": _text(row.get("script_clean_text")),
+        "likes": _safe_int(row.get("liked_count")),
+        "favorites": _safe_int(row.get("collected_count")),
+        "shares": _safe_int(row.get("share_count")),
+        "comments": _text(row.get("top_valid_comments")),
+    }
+
+
+def _standard_output_row_is_importable(row: Dict[str, Any]) -> bool:
+    script_text = _text(row.get("script_text"))
+    return bool(_text(row.get("video_id"))) and len(script_text) >= STANDARD_OUTPUT_MIN_SCRIPT_CHARS
+
+
 def _build_asset_row(
     search_row: Dict[str, Any],
     title_row: Dict[str, Any],
@@ -311,11 +364,24 @@ def build_content_asset(
     script_sources_csv: Optional[Path] = None,
     script_raw_csv: Optional[Path] = None,
     script_clean_csv: Optional[Path] = None,
+    content_asset_comments_limit: Optional[int] = None,
+    content_asset_full_comments_limit: Optional[int] = None,
 ) -> Tuple[Path, Path, Dict[str, Any]]:
     """Generate content_asset.jsonl/csv and return their paths plus stats."""
     stats = _empty_stats()
+    comments_limit = _coerce_limit(
+        content_asset_comments_limit,
+        STANDARD_OUTPUT_MAX_COMMENTS_PER_VIDEO,
+    )
+    full_comments_limit = _coerce_limit(
+        content_asset_full_comments_limit,
+        FULL_OUTPUT_MAX_COMMENTS_PER_VIDEO,
+    )
+    stats["content_asset_comments_limit"] = comments_limit
+    stats["content_asset_full_comments_limit"] = full_comments_limit
     output_dir.mkdir(parents=True, exist_ok=True)
     jsonl_path = output_dir / "content_asset.jsonl"
+    full_csv_path = output_dir / "content_asset_full.csv"
     csv_path = output_dir / "content_asset.csv"
 
     search_rows = _read_csv(search_result_csv, "search_result", stats)
@@ -328,7 +394,8 @@ def build_content_asset(
     script_clean_rows = _read_csv(script_clean_csv, "script_clean", stats)
 
     title_index = _build_index(title_rows)
-    comment_index = _aggregate_comments(comment_rows)
+    comment_index = _aggregate_comments(comment_rows, comments_limit=full_comments_limit)
+    standard_comment_index = _aggregate_comments(comment_rows, comments_limit=comments_limit)
     script_source_index = _build_index(script_source_rows)
     script_raw_index = _build_index(script_raw_rows)
     script_clean_index = _build_index(script_clean_rows)
@@ -356,6 +423,7 @@ def build_content_asset(
         rows.append(row)
 
     stats["rows_out"] = len(rows)
+    stats["content_asset_full_rows"] = len(rows)
     stats["comments_available"] = sum(1 for row in rows if row["comment_data_status"] == "available")
     stats["scripts_available"] = sum(1 for row in rows if _text(row.get("script_clean_text")))
     stats["valid_comments_total"] = sum(_safe_int(row.get("valid_comment_count")) for row in rows)
@@ -366,14 +434,38 @@ def build_content_asset(
     stats["missing_script_total"] = sum(
         1 for row in rows if not _text(row.get("script_clean_text"))
     )
+    standard_rows_all = []
+    for search_row, row in zip(search_rows, rows):
+        standard_comment_row = _find_match(standard_comment_index, search_row, _COMMENT_MATCH_FIELDS)
+        standard_row = dict(row)
+        standard_row["top_valid_comments"] = _text(standard_comment_row.get("top_valid_comments"))
+        standard_rows_all.append(_standard_output_row(standard_row))
+    standard_rows_valid = [
+        row for row in standard_rows_all
+        if _standard_output_row_is_importable(row)
+    ]
+    standard_rows = standard_rows_valid[:STANDARD_OUTPUT_MAX_ROWS]
+    stats["standard_rows_out"] = len(standard_rows)
+    stats["standard_rows_skipped"] = len(rows) - len(standard_rows)
+    stats["content_asset_rows"] = len(standard_rows)
+    if len(standard_rows_valid) > STANDARD_OUTPUT_MAX_ROWS:
+        stats["errors"].append(
+            f"standard_output_row_limit: kept={STANDARD_OUTPUT_MAX_ROWS} total={len(standard_rows_valid)}"
+        )
 
     with open(str(jsonl_path), "w", encoding="utf-8") as f:
         for row in rows:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
-    with open(str(csv_path), "w", encoding="utf-8-sig", newline="") as f:
+    with open(str(full_csv_path), "w", encoding="utf-8-sig", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=CONTENT_ASSET_FIELDNAMES)
         writer.writeheader()
         writer.writerows(rows)
+    stats["content_asset_full_csv_generated"] = True
+
+    with open(str(csv_path), "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=STANDARD_OUTPUT_FIELDNAMES)
+        writer.writeheader()
+        writer.writerows(standard_rows)
     stats["content_asset_csv_generated"] = True
     return jsonl_path, csv_path, stats

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -46,3 +47,15 @@ def pytest_collection_modifyitems(
 
         if "external" in item.keywords and not run_external:
             item.add_marker(external_skip)
+
+
+@pytest.fixture(autouse=True)
+def _shutdown_live_task_managers_after_test() -> None:
+    """Release API task worker threads before pytest starts closing streams."""
+    yield
+    tasks_module = sys.modules.get("api.tasks")
+    if tasks_module is None:
+        return
+    shutdown_all = getattr(tasks_module, "shutdown_all_task_managers", None)
+    if shutdown_all is not None:
+        shutdown_all()
