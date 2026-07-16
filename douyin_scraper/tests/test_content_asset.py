@@ -21,6 +21,11 @@ def _read_jsonl(path: Path) -> list[dict]:
     ]
 
 
+def _read_csv(path: Path) -> list[dict]:
+    with open(path, "r", encoding="utf-8-sig", newline="") as f:
+        return [dict(row) for row in csv.DictReader(f)]
+
+
 def test_content_asset_from_search_and_title_only(tmp_path: Path) -> None:
     search_outputs = tmp_path / "workspaces" / "search-task" / "outputs"
     _write_csv(

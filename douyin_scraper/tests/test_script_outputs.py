@@ -211,8 +211,8 @@ def test_script_raw_default_limit_follows_max_videos_per_keyword(
         ),
         patch.object(
             scraper,
-            "_download_video_with_retry",
-            return_value=VideoDownloadResult(success=True, attempts=1, error=""),
+            "_download_video",
+            return_value=True,
         ) as download,
         patch.object(scraper, "_transcribe_video", return_value="ASR text"),
     ):
